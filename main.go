@@ -91,7 +91,7 @@ func newGenCommand(globals *globalOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "gen",
 		Short:   "渲染模板并产出纯静态站",
-		Long:    "渲染模板并产出纯静态站：页面按目录式落盘，其余文件原样拷贝；生成前清空产物目录，任一页面渲染失败即整体失败。",
+		Long:    "渲染模板并产出纯静态站：页面按源码路径落盘（about.html -> dist/about.html），其余文件原样拷贝；生成前清空产物目录，任一页面渲染失败即整体失败。",
 		Example: genExample,
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -208,9 +208,12 @@ const rootLongDescription = `goweb 用两个子命令覆盖「本地写页面 �
   局部模板目录（--template，默认 templates）里的 html 只参与模板解析、不产出页面，
   也不能被直接访问；templates/data.json 的顶层对象是所有页面共用的模板数据。
 
-URL 规则（与 gen 产物布局严格一致）：
-  /、/about/、/help/74/ 是唯一 URL；/about、/about.html、/index.html 一律 301
-  到目录 URL；未命中页面时按磁盘真实文件直出；其余返回纯文本 404。`
+URL 规则（产物跟随源码路径，serve 不做任何重定向）：
+  about.html       -> /about.html，同时也接受 /about、/about/、/about/index.html
+  index.html       -> /
+  help/index.html  -> /help/ 或 /help/index.html
+  除 //x//、/a/../b 这类非规范路径会 301 归一化外，其余写法一律直接 200；
+  未命中页面时按磁盘真实文件直出；其余返回纯文本 404。`
 
 const rootExample = `  goweb                        # 等价于 goweb serve，访问 http://localhost:8080/
   goweb --addr :3000           # 换端口

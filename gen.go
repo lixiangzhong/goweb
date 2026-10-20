@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 )
@@ -60,7 +59,9 @@ func Generate(site *Site, opts GenOptions) (GenResult, error) {
 		if err != nil {
 			return result, fmt.Errorf("渲染页面 %s: %w", name, err)
 		}
-		target := filepath.Join(out, filepath.FromSlash(pageOutput(name)))
+		// 产物严格跟随源码路径：about.html -> dist/about.html，
+		// help/74.html -> dist/help/74.html。
+		target := filepath.Join(out, filepath.FromSlash(name+pageExt))
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return result, fmt.Errorf("创建页面目录 %q: %w", filepath.Dir(target), err)
 		}
@@ -84,15 +85,6 @@ func (o GenOptions) logger() *slog.Logger {
 		return o.Logger
 	}
 	return slog.New(slog.DiscardHandler)
-}
-
-// pageOutput 把页面模板名映射为产物文件：
-// index 页落在所在目录的 index.html，其余页面各自成一个目录。
-func pageOutput(name string) string {
-	if name == indexName || strings.HasSuffix(name, "/"+indexName) {
-		return name + pageExt
-	}
-	return path.Join(name, indexName) + pageExt
 }
 
 // guardOutDir 拦截会破坏源码的产物目录：页面目录本身、页面目录的祖先、

@@ -321,68 +321,71 @@ type Route struct {
 	File     string // RouteFile 时的磁盘路径
 }
 
-// Resolve 按目录式语义把 URL 路径映射为页面、静态文件或 301 目标。
+// Resolve 把 URL 路径映射为页面、静态文件或 301 目标。
 //
-// 规则与 gen 的产物布局严格一致：页面 URL 一定以 / 结尾，与静态托管
-// （nginx / GitHub Pages / file://）对 <dir>/index.html 的解析方式相同。
-// 局部模板目录整体不可访问（含 data.json 这类非 html 文件）。
+// serve 不做尾斜杠与扩展名的重定向：同一个页面用 /about、/about/、/about.html、
+// /about/index.html 都能直接打开，URL 原样保留。只有非规范路径（//about//、/a/../b）
+// 才 301 归一化。
+//
+// 产物是扁平的真实文件路径（about.html -> dist/about.html），因此线上只有
+// /about.html 必然存在；其余写法是否可用取决于托管端配置。
 func (s *Site) Resolve(urlPath string) Route {
 	canonical := canonicalPath(urlPath)
 	if canonical != urlPath {
 		return Route{Kind: RouteRedirect, Location: canonical}
 	}
 
-	switch {
-	case canonical == "/":
-		return s.pageRoute(indexName)
-	case strings.HasSuffix(canonical, "/"):
-		base := strings.Trim(canonical, "/")
-		if route := s.pageRoute(path.Join(base, indexName)); route.Kind == RoutePage {
-			return route
+	for _, name := range s.candidates(canonical) {
+		if s.hasPage(name) {
+			return Route{Kind: RoutePage, Name: name}
 		}
-		return s.pageRoute(base)
-	case strings.EqualFold(path.Ext(canonical), pageExt):
-		// 页面 URL 不带扩展名，带 .html 一律收敛到目录 URL；
-		// 非页面（例如局部模板）直接视为不存在，避免重定向到 404。
-		target := strings.TrimSuffix(canonical, path.Ext(canonical))
-		if strings.HasSuffix(target, "/"+indexName) {
-			target = strings.TrimSuffix(target, indexName)
-		} else {
-			target += "/"
-		}
-		if s.hasPageURL(target) {
-			return Route{Kind: RouteRedirect, Location: target}
-		}
-		return Route{Kind: RouteNotFound}
-	default:
-		name := strings.TrimPrefix(canonical, "/")
-		if s.hasPageURL(name + "/") {
-			return Route{Kind: RouteRedirect, Location: canonical + "/"}
-		}
-		if filePath, ok := s.filePath(canonical); ok && !s.WithinTemplateDir(filePath) {
-			if info, err := os.Stat(filePath); err == nil && !info.IsDir() {
-				return Route{Kind: RouteFile, File: filePath}
-			}
-		}
-		return Route{Kind: RouteNotFound}
 	}
-}
-
-// pageRoute 在模板存在且是页面时返回页面路由。
-func (s *Site) pageRoute(name string) Route {
-	if s.hasPage(name) {
-		return Route{Kind: RoutePage, Name: name}
+	if route, ok := s.staticRoute(canonical); ok {
+		return route
 	}
 	return Route{Kind: RouteNotFound}
 }
 
-// hasPageURL 判断以 / 结尾的目录 URL 是否有对应页面。
-func (s *Site) hasPageURL(dirURL string) bool {
-	base := strings.Trim(dirURL, "/")
-	if base == "" {
-		return s.hasPage(indexName)
+// candidates 按宽容顺序给出 URL 可能对应的页面模板名。
+func (s *Site) candidates(urlPath string) []string {
+	trimmed := strings.Trim(urlPath, "/")
+	switch {
+	case trimmed == "":
+		return []string{indexName}
+
+	case strings.HasSuffix(urlPath, "/"):
+		// 目录写法：优先目录的 index 页，找不到再回退同名页面（扁平产物）。
+		return []string{path.Join(trimmed, indexName), trimmed}
+
+	case strings.EqualFold(path.Ext(trimmed), pageExt):
+		base := strings.TrimSuffix(trimmed, path.Ext(trimmed))
+		// about/index.html 这类产物式路径：先找同名页面，再回退上一级页面。
+		if strings.HasSuffix(base, "/"+indexName) {
+			return []string{base, strings.TrimSuffix(base, "/"+indexName)}
+		}
+		return []string{base}
+
+	default:
+		// 无扩展名写法：优先同名页面，再回退同名目录的 index 页。
+		return []string{trimmed, path.Join(trimmed, indexName)}
 	}
-	return s.hasPage(path.Join(base, indexName)) || s.hasPage(base)
+}
+
+// staticRoute 处理没有对应页面的 URL：只提供页面目录内、且不在局部模板目录
+// 与产物目录里的真实文件。
+func (s *Site) staticRoute(urlPath string) (Route, bool) {
+	if strings.HasSuffix(urlPath, "/") {
+		return Route{}, false
+	}
+	filePath, ok := s.filePath(urlPath)
+	if !ok || s.WithinTemplateDir(filePath) || s.isExcluded(filePath) {
+		return Route{}, false
+	}
+	info, err := os.Stat(filePath)
+	if err != nil || info.IsDir() {
+		return Route{}, false
+	}
+	return Route{Kind: RouteFile, File: filePath}, true
 }
 
 // filePath 把 URL 路径解析为页面目录内的磁盘路径，越界时返回 false。

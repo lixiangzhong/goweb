@@ -28,10 +28,10 @@ func TestGenerateOutputTree(t *testing.T) {
 
 	wantFiles := []string{
 		"index.html",
-		"about/index.html",
+		"about.html",
 		"help/index.html",
-		"help/74/index.html",
-		"UPPER/index.html",
+		"help/74.html",
+		"UPPER.html",
 		"static/css/a.css",
 		"robots.txt",
 	}
@@ -41,9 +41,11 @@ func TestGenerateOutputTree(t *testing.T) {
 		}
 	}
 
-	// 页面源文件、局部模板、被忽略目录都不应进入产物。
+	// 页面产物跟随源码路径，不再产出 <页面>/index.html 这类目录式布局；
+	// 局部模板与被忽略目录也不应出现在产物中。
 	unwanted := []string{
-		"about.html",
+		"about/index.html",
+		"help/74/index.html",
 		"templates/header.html",
 		"templates/data.json",
 		"templates/note.txt",
@@ -64,7 +66,7 @@ func TestGenerateOutputTree(t *testing.T) {
 		t.Fatalf("资源数 = %d，期望 2", result.Assets)
 	}
 
-	body, err := os.ReadFile(filepath.Join(out, "about", "index.html"))
+	body, err := os.ReadFile(filepath.Join(out, "about.html"))
 	if err != nil {
 		t.Fatalf("读取产物页面: %v", err)
 	}

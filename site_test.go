@@ -89,29 +89,39 @@ func TestResolve(t *testing.T) {
 		wantTarget string // RouteRedirect 的目标 URL 或 RoutePage 的模板名
 	}{
 		{path: "/", wantKind: RoutePage, wantTarget: "index"},
+		{path: "/index.html", wantKind: RoutePage, wantTarget: "index"},
+		// 同一个页面的多种写法都直接命中，不做任何重定向。
+		{path: "/about.html", wantKind: RoutePage, wantTarget: "about"},
+		{path: "/about", wantKind: RoutePage, wantTarget: "about"},
 		{path: "/about/", wantKind: RoutePage, wantTarget: "about"},
-		{path: "/about", wantKind: RouteRedirect, wantTarget: "/about/"},
-		{path: "/about.html", wantKind: RouteRedirect, wantTarget: "/about/"},
-		{path: "/index.html", wantKind: RouteRedirect, wantTarget: "/"},
+		{path: "/about/index.html", wantKind: RoutePage, wantTarget: "about"},
+		// 目录 index 页。
 		{path: "/help/", wantKind: RoutePage, wantTarget: "help/index"},
-		{path: "/help", wantKind: RouteRedirect, wantTarget: "/help/"},
+		{path: "/help", wantKind: RoutePage, wantTarget: "help/index"},
+		{path: "/help/index.html", wantKind: RoutePage, wantTarget: "help/index"},
 		{path: "/help/74/", wantKind: RoutePage, wantTarget: "help/74"},
-		{path: "/help/74", wantKind: RouteRedirect, wantTarget: "/help/74/"},
-		{path: "/help/74.html", wantKind: RouteRedirect, wantTarget: "/help/74/"},
-		{path: "/help/index.html", wantKind: RouteRedirect, wantTarget: "/help/"},
-		{path: "/UPPER/", wantKind: RoutePage, wantTarget: "UPPER"},
-		{path: "/UPPER.HTML", wantKind: RouteRedirect, wantTarget: "/UPPER/"},
+		{path: "/help/74", wantKind: RoutePage, wantTarget: "help/74"},
+		{path: "/help/74.html", wantKind: RoutePage, wantTarget: "help/74"},
+		// 大写扩展名同样按页面处理。
+		{path: "/UPPER.HTML", wantKind: RoutePage, wantTarget: "UPPER"},
+		{path: "/UPPER", wantKind: RoutePage, wantTarget: "UPPER"},
+		// 只有非规范路径才 301 归一化。
 		{path: "//about//", wantKind: RouteRedirect, wantTarget: "/about/"},
+		{path: "/a/../about", wantKind: RouteRedirect, wantTarget: "/about"},
+		// 静态文件直出。
 		{path: "/static/css/a.css", wantKind: RouteFile},
 		{path: "/robots.txt", wantKind: RouteFile},
+		// 局部模板目录整体不可访问。
 		{path: "/templates/header.html", wantKind: RouteNotFound},
 		{path: "/templates/header", wantKind: RouteNotFound},
 		{path: "/templates/data.json", wantKind: RouteNotFound},
 		{path: "/templates/note.txt", wantKind: RouteNotFound},
+		// 产物目录同样不对外提供。
+		{path: "/dist/old.html", wantKind: RouteNotFound},
+		{path: "/dist/old", wantKind: RouteNotFound},
 		{path: "/static/", wantKind: RouteNotFound},
 		{path: "/missing", wantKind: RouteNotFound},
 		{path: "/missing/", wantKind: RouteNotFound},
-		{path: "/dist/old", wantKind: RouteNotFound},
 	}
 
 	for _, test := range tests {
@@ -336,20 +346,6 @@ func TestCanonicalPath(t *testing.T) {
 	for input, want := range tests {
 		if got := canonicalPath(input); got != want {
 			t.Fatalf("canonicalPath(%q) = %q，期望 %q", input, got, want)
-		}
-	}
-}
-
-func TestPageOutput(t *testing.T) {
-	tests := map[string]string{
-		"index":      "index.html",
-		"about":      "about/index.html",
-		"help/index": "help/index.html",
-		"help/74":    "help/74/index.html",
-	}
-	for name, want := range tests {
-		if got := pageOutput(name); got != want {
-			t.Fatalf("pageOutput(%q) = %q，期望 %q", name, got, want)
 		}
 	}
 }
