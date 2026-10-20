@@ -24,9 +24,14 @@ builds:
     goos:
       - darwin
       - linux
+      - windows
     goarch:
       - amd64
       - arm64
+    # Windows 只发 amd64：CI 里只验证了 windows/amd64，arm64 从未测过。
+    ignore:
+      - goos: windows
+        goarch: arm64
 
 archives:
   - id: goweb
@@ -37,6 +42,11 @@ archives:
     files:
       - README.md
       - LICENSE
+    # Windows 用户习惯 zip 解压即用，单独覆盖归档格式。
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
 
 checksum:
   name_template: checksums.txt
