@@ -17,6 +17,8 @@ jobs:
         os:
           - ubuntu-latest
           - macos-latest
+          # Windows 只做代码验证，不发二进制；-race 在 Windows 需要 C 工具链，见下方步骤。
+          - windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -28,6 +30,7 @@ jobs:
           cache: true
 
       - name: Check formatting
+        shell: bash
         run: |
           unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then
@@ -37,6 +40,7 @@ jobs:
           fi
 
       - name: Verify go.mod is tidy
+        shell: bash
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
@@ -45,10 +49,16 @@ jobs:
         run: go vet ./...
 
       - name: Unit tests
-        run: go test -short -race -count=1 -coverprofile=coverage.out ./...
+        run: go test -short -count=1 -coverprofile=coverage.out ./...
 
       - name: Coverage summary
+        shell: bash
         run: go tool cover -func=coverage.out | tail -1
 
+      - name: Unit tests with race detector
+        # Windows 上 -race 需要 gcc/mingw 工具链，这里不依赖它；Linux 与 macOS 仍全量跑。
+        if: runner.os != 'Windows'
+        run: go test -short -count=1 -race ./...
+
       - name: E2E tests (real binary + HTTP + hot reload)
-        run: go test -race -count=1 -run TestE2E ./...
+        run: go test -count=1 -run TestE2E ./...
