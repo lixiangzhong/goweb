@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 
@@ -145,18 +146,25 @@ func runServe(cmd *cobra.Command, opts serveOptions) error {
 	}
 	defer stopWatch()
 
+	// 先监听再打印日志：--addr 写 :0 时日志给出的是内核分配的真实地址，
+	// 脚本与端到端测试可以直接读它。
+	listener, err := net.Listen("tcp", opts.addr)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+
 	server := &http.Server{
-		Addr:              opts.addr,
 		Handler:           newHandler(site, logger),
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
 	logger.Info("goweb 开发服务器已启动",
-		"addr", opts.addr,
+		"addr", listener.Addr().String(),
 		"dir", site.Root(),
 		"pages", len(site.Pages()),
 		"data", site.DataFile(),
 	)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
