@@ -36,7 +36,7 @@
 
 - **零配置零构建**：站点就是一堆 `.html` + css/js，写完直接预览，不用装任何前端工具链。
 - **产物跟随源码路径**：`about.html` → `dist/about.html`，`help/74.html` → `dist/help/74.html`，产物与源码一一对应，部署后 `file://` 也能直接打开。
-- **开发服务器零重定向**：`/about`、`/about/`、`/about.html`、`/about/index.html` 都能直接打开，URL 原样保留（只有 `//about//` 这类非规范路径才 301 归一化）。
+- **开发服务器等效 `try_files`**：解析顺序就是 nginx 的 `try_files $uri $uri.html $uri/index.html`，零重定向；本地结果与用同一行配置部署的线上结果逐条一致（含 404）。
 - **复用页头页脚**：直接用 Go 的 `html/template`，`{{define}}` + `{{template}}` 抽公共片段，不需要学新语法。
 - **站点级数据**：`templates/data.json` 提供站名、备案号、导航等共享变量，页面与局部模板都能取。
 - **保存即可见**：模板、页面或数据文件变更后自动重新加载，浏览器刷新即可；改到一半的坏模板不会让服务挂掉。
@@ -209,23 +209,29 @@ dist/static/css/site.css
 
 ## URL 规则
 
-`serve` **不做尾斜杠与扩展名的重定向**：只要能对上页面，URL 原样保留直接返回 200。
+`serve` 的解析顺序**等效于 nginx 的 `try_files $uri $uri.html $uri/index.html`**，零重定向、URL 原样保留。
+下表的线上两列是实测结果（同一份扁平产物）：只要部署端用这行 `try_files`，本地与线上逐条一致。
 
-| 请求 | 本地 serve | 产物里存在？ | GitHub Pages / Netlify / Cloudflare | 裸 nginx |
-| --- | --- | --- | --- | --- |
-| `/about.html` | 200 | 是（`dist/about.html`） | 200 | 200 |
-| `/about` | 200 | 否，属宽容写法 | 200 | 404（加一行 `try_files` 后 200） |
-| `/about/` | 200 | 否 | 404 | 404 |
-| `/about/index.html` | 200 | 否 | 404 | 404 |
-| `/help/`、`/help/index.html` | 200 | 是 | 200 | 200 |
-| `/help` | 200 | 否 | 301 → `/help/` | 301 → `/help/` |
-| `/static/css/site.css` | 200（磁盘文件直出） | 是 | 200 | 200 |
-| `//about//`、`/a/../about` | `301` 归一化 | — | — | — |
-| `/templates/*`、`/dist/*` | `404` | 局部模板目录与产物目录不对外提供 | 404 | 404 |
-| 其他 | 纯文本 `404`（无自定义 404 页面，不做目录列表） | — | — | — |
+| 请求 | 命中方式 | 本地 serve | GH Pages / Netlify / Cloudflare | 裸 nginx | nginx + 该行 `try_files` |
+| --- | --- | --- | --- | --- | --- |
+| `/about.html` | `$uri`（真实文件） | 200 | 200 | 200 | 200 |
+| `/about` | `$uri.html` | 200 | 200 | 404 | 200 |
+| `/about/` | 目录不存在 | **404** | 404 | 404 | 404 |
+| `/about/index.html` | 无此文件 | **404** | 404 | 404 | 404 |
+| `/help` | `$uri/index.html` | 200 | 301 → `/help/` | 301 → `/help/` | 200 |
+| `/help/` | 目录 + index | 200 | 200 | 200 | 200 |
+| `/static/css/site.css` | `$uri`（静态文件） | 200 | 200 | 200 | 200 |
+| `//about//` | 归一化成 `/about/` | 404 | 404 | 404 | 404 |
+| `/a/../about` | 归一化成 `/about` | 200 | 200 | 200 | 200 |
+| `/templates/*`、`/dist/*` | 忽略项视为不存在 | 404 | 404 | 404 | 404 |
+| 其他 | 都不命中 | 纯文本 `404` | 404 | 404 | 404 |
 
-**代价要说清楚**：同一个页面存在多个可用 URL，但线上**只有 `/about.html` 必然存在**。
-站内链接建议统一写 `/about.html`（或部署端加一行 `try_files`，让无扩展名写法在线上也可用，见[部署](#部署)）。
+要点：
+
+- **`/about` 能开、`/about/` 打不开**，这不是 bug：扁平产物里没有 `about/` 目录，`$uri` 的目录检查必然失败——nginx 实测同样是 404。
+- 非规范路径（`//about//`、`/a/../about`、`/about/.`）**静默归一化，不重定向**，与 nginx 的 `merge_slashes` + `remove_dot_segments` 行为一致。
+- 局部模板目录、产物目录、隐藏项与 `node_modules` 一律视为不存在，与产物内容保持一致。
+- 因此**站内链接写 `/about.html` 最稳**（任何托管都必然可用）；想让无扩展名写法在线上也可用，见[部署](#部署)里的那一行 `try_files`。
 
 非 GET/HEAD 请求返回 `405`；开发期响应带 `Cache-Control: no-store`，避免改完文件被浏览器旧副本挡住。
 
@@ -266,15 +272,16 @@ server {
     root /var/www/mysite/dist;
     index index.html;
 
-    # 可选：让无扩展名 URL（/about）在线上也直接命中 about.html，而不是 404
+    # 与 goweb serve 完全等效：无扩展名 URL（/about）也直接命中 about.html
     location / {
-        try_files $uri $uri.html $uri/index.html $uri/ =404;
+        try_files $uri $uri.html $uri/index.html =404;
     }
 }
 ```
 
-- **GitHub Pages / Cloudflare Pages / Netlify / Vercel**：构建命令填 `goweb gen`，发布目录填 `dist`；这些平台原生支持无扩展名 URL，无需额外配置。
-- **nginx / Apache / Caddy**：把 `dist/` 拷进去即可，`/about.html` 与 `/help/` 开箱可用；想让 `/about` 也直接可用就加上面的 `try_files` 一行。
+- **nginx**：把 `dist/` 拷进去即可，`/about.html` 与 `/help/` 开箱可用；加上面这行 `try_files` 后，本地 `goweb serve` 与线上**逐条一致**（含 `/about` 200、`/about/` 404）。
+- **GitHub Pages / Cloudflare Pages / Netlify / Vercel**：构建命令填 `goweb gen`，发布目录填 `dist`；这些平台原生支持 `/about` 这类无扩展名 URL，与本地也一致。
+- **Apache / Caddy**：默认配置下 `/about.html` 可用；要支持无扩展名 URL 需自己配 rewrite（与 `try_files` 等效的规则）。
 - **对象存储（OSS/COS/S3）**：开启静态网站托管并设置索引文档为 `index.html`。
 
 > 直接用 `file://` 双击打开 `dist/index.html` 时，`/static/...` 这类**以 `/` 开头的绝对路径会失效**（根变成了文件系统根）。本地预览请用 `goweb serve`，或把资源链接改成相对路径。
@@ -309,7 +316,7 @@ goweb completion zsh > "${fpath[1]}/_goweb"
 
 ## 设计取舍
 
-- **开发服务器零重定向、接受多种写法**：`/about`、`/about/`、`/about.html`、`/about/index.html` 都直接 200，URL 原样保留；代价是同一页面有多个可用 URL，而线上只有 `/about.html` 真实存在（无扩展名写法在 GitHub Pages/Netlify/Cloudflare 原生可用，nginx 需一行 `try_files`），因此**站内链接建议统一写 `/about.html`**。
+- **开发服务器等效 `try_files`**：解析顺序就是 `try_files $uri $uri.html $uri/index.html`，零重定向、不做 URL 重写；本地结果与用同一行配置部署的线上结果逐条一致（`/about` 能开、`/about/` 404 都一致），站内链接写 `/about.html` 最稳。
 - **单一 `html/template` 命名空间**：所有页面与局部模板一起解析，`{{template "x" .}}` 全局可用；代价是不同文件里同名 `define` 会互相覆盖。
 - **不做缺键校验**：JSON 直接解成 map 当模板数据，缺键渲染成空串而不是报错，实现最简且不会误伤 `range`/`with` 内部取值；代价是拼错键名会静默留白。
 - **开发期不做浏览器热刷新**：只重载模板与数据，不注入任何脚本，`gen` 产物因此天然干净。
