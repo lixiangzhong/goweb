@@ -299,14 +299,12 @@ func (s *Site) hasPage(name string) bool {
 	return ok
 }
 
-// RouteKind 是 URL 到页面/文件/重定向的映射结果类型。
+// RouteKind 是 URL 到页面/文件的映射结果类型。
 type RouteKind int
 
 const (
-	// RouteRedirect 表示需要 301 到规范 URL。
-	RouteRedirect RouteKind = iota
 	// RoutePage 表示命中页面模板。
-	RoutePage
+	RoutePage RouteKind = iota
 	// RouteFile 表示命中磁盘上的静态文件。
 	RouteFile
 	// RouteNotFound 表示既没有页面也没有文件。
@@ -315,108 +313,149 @@ const (
 
 // Route 描述一次 URL 映射的结果。
 type Route struct {
-	Kind     RouteKind
-	Location string // RouteRedirect 时的目标 URL
-	Name     string // RoutePage 时的模板名
-	File     string // RouteFile 时的磁盘路径
+	Kind RouteKind
+	Name string // RoutePage 时的模板名
+	File string // RouteFile 时的磁盘路径
 }
 
-// Resolve 把 URL 路径映射为页面、静态文件或 301 目标。
-//
-// serve 不做尾斜杠与扩展名的重定向：同一个页面用 /about、/about/、/about.html、
-// /about/index.html 都能直接打开，URL 原样保留。只有非规范路径（//about//、/a/../b）
-// 才 301 归一化。
-//
-// 产物是扁平的真实文件路径（about.html -> dist/about.html），因此线上只有
-// /about.html 必然存在；其余写法是否可用取决于托管端配置。
-func (s *Site) Resolve(urlPath string) Route {
-	canonical := canonicalPath(urlPath)
-	if canonical != urlPath {
-		return Route{Kind: RouteRedirect, Location: canonical}
-	}
+// routeCandidate 是 try_files 的一个候选项：磁盘相对路径，以及命中该文件时
+// 应渲染的页面模板名（为空表示该文件只能按静态资源直出）。
+type routeCandidate struct {
+	rel  string
+	page string
+}
 
-	for _, name := range s.candidates(canonical) {
-		if s.hasPage(name) {
-			return Route{Kind: RoutePage, Name: name}
+// Resolve 把 URL 路径映射为页面或静态文件，等效于 nginx 的
+//
+//	try_files $uri $uri.html $uri/index.html =404;
+//
+// 因此不做任何重定向，URL 原样保留：
+//
+//	/about.html -> $uri 命中真实文件        -> 渲染页面 about
+//	/about      -> $uri.html 命中           -> 渲染页面 about
+//	/about/     -> 目录不存在               -> 404
+//	/help       -> $uri/index.html 命中     -> 渲染页面 help/index
+//	/help/      -> 目录存在，由 index 提供   -> 渲染页面 help/index
+//	/static/a.css、/robots.txt -> $uri 命中 -> 静态文件直出
+//
+// 非规范路径按 nginx（merge_slashes 开 + remove_dot_segments）的方式静默归一化，
+// 同样不重定向：//about// 归一化后是 /about/（404），/a/../about 归一化后命中 about。
+// 局部模板目录、产物目录与扫描忽略项一律视为不存在，保证与 gen 产物部署后的
+// 线上行为一致。
+func (s *Site) Resolve(urlPath string) Route {
+	for _, candidate := range s.candidates(normalizePath(urlPath)) {
+		if route, ok := s.match(candidate); ok {
+			return route
 		}
-	}
-	if route, ok := s.staticRoute(canonical); ok {
-		return route
 	}
 	return Route{Kind: RouteNotFound}
 }
 
-// candidates 按宽容顺序给出 URL 可能对应的页面模板名。
-func (s *Site) candidates(urlPath string) []string {
+// candidates 按 try_files 的顺序给出候选文件。
+//
+// urlPath 以 / 结尾时，$uri 命中的是目录，由托管端的 index 规则提供
+// <目录>/index.html，因此只有这一个候选。
+func (s *Site) candidates(urlPath string) []routeCandidate {
 	trimmed := strings.Trim(urlPath, "/")
-	switch {
-	case trimmed == "":
-		return []string{indexName}
 
-	case strings.HasSuffix(urlPath, "/"):
-		// 目录写法：优先目录的 index 页，找不到再回退同名页面（扁平产物）。
-		return []string{path.Join(trimmed, indexName), trimmed}
-
-	case strings.EqualFold(path.Ext(trimmed), pageExt):
-		base := strings.TrimSuffix(trimmed, path.Ext(trimmed))
-		// about/index.html 这类产物式路径：先找同名页面，再回退上一级页面。
-		if strings.HasSuffix(base, "/"+indexName) {
-			return []string{base, strings.TrimSuffix(base, "/"+indexName)}
-		}
-		return []string{base}
-
-	default:
-		// 无扩展名写法：优先同名页面，再回退同名目录的 index 页。
-		return []string{trimmed, path.Join(trimmed, indexName)}
-	}
-}
-
-// staticRoute 处理没有对应页面的 URL：只提供页面目录内、且不在局部模板目录
-// 与产物目录里的真实文件。
-func (s *Site) staticRoute(urlPath string) (Route, bool) {
 	if strings.HasSuffix(urlPath, "/") {
-		return Route{}, false
+		if trimmed == "" {
+			return []routeCandidate{{rel: indexName + pageExt, page: indexName}}
+		}
+		return []routeCandidate{{
+			rel:  path.Join(trimmed, indexName) + pageExt,
+			page: path.Join(trimmed, indexName),
+		}}
 	}
-	filePath, ok := s.filePath(urlPath)
-	if !ok || s.WithinTemplateDir(filePath) || s.isExcluded(filePath) {
-		return Route{}, false
+
+	return []routeCandidate{
+		{rel: trimmed, page: pageNameOf(trimmed)},
+		{rel: trimmed + pageExt, page: trimmed},
+		{rel: path.Join(trimmed, indexName) + pageExt, page: path.Join(trimmed, indexName)},
 	}
-	info, err := os.Stat(filePath)
-	if err != nil || info.IsDir() {
-		return Route{}, false
-	}
-	return Route{Kind: RouteFile, File: filePath}, true
 }
 
-// filePath 把 URL 路径解析为页面目录内的磁盘路径，越界时返回 false。
-func (s *Site) filePath(urlPath string) (string, bool) {
-	rel := strings.TrimPrefix(path.Clean(urlPath), "/")
+// match 判断候选文件是否可用：命中页面时返回页面路由，否则按静态文件直出。
+func (s *Site) match(candidate routeCandidate) (Route, bool) {
+	file, ok := s.servableFile(candidate.rel)
+	if !ok {
+		return Route{}, false
+	}
+	if candidate.page == "" {
+		return Route{Kind: RouteFile, File: file}, true
+	}
+	if !s.hasPage(candidate.page) {
+		// 页面目录内可被提供的 html 都是页面；出现没注册成页面的 html 时按不存在处理，
+		// 避免把未渲染的模板源码直接吐给浏览器。
+		return Route{}, false
+	}
+	return Route{Kind: RoutePage, Name: candidate.page}, true
+}
+
+// pageNameOf 返回文件相对路径对应的页面模板名；非 html 文件返回空。
+func pageNameOf(rel string) string {
+	ext := path.Ext(rel)
+	if ext == "" || !strings.EqualFold(ext, pageExt) {
+		return ""
+	}
+	return strings.TrimSuffix(rel, ext)
+}
+
+// servableFile 把 URL 相对路径解析为可对外提供的常规文件。
+// 局部模板目录、产物目录与扫描忽略项（隐藏项、node_modules）一律视为不存在，
+// 与 gen 产物部署后的行为保持一致。
+func (s *Site) servableFile(rel string) (string, bool) {
 	if rel == "" {
 		return "", false
 	}
 	full := filepath.Join(s.root, filepath.FromSlash(rel))
-	// path.Clean 已经消除了 ..，这里再做一次边界校验，避免拼接结果逃出页面目录。
+	// 归一化已经消除了 .. 段，这里再做一次边界校验，避免拼接结果逃出页面目录。
 	back, err := filepath.Rel(s.root, full)
 	if err != nil || back == ".." || strings.HasPrefix(back, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	if s.Ignored(full) || s.WithinTemplateDir(full) {
+		return "", false
+	}
+	info, err := os.Stat(full)
+	if err != nil || !info.Mode().IsRegular() {
 		return "", false
 	}
 	return full, true
 }
 
-// canonicalPath 归一化 URL 路径并保留有意义的尾斜杠。
-func canonicalPath(urlPath string) string {
-	if urlPath == "" {
-		return "/"
-	}
+// normalizePath 按 nginx 的方式归一化 URL 路径：折叠重复斜杠、解析 . 与 .. 段，
+// 并保留尾斜杠（尾斜杠表示目录）。
+//
+// 与 path.Clean 的区别在于 "/about/." 这类写法：RFC 3986 的 remove_dot_segments
+// 会把它视为目录("/about/")，而 path.Clean 会得到 "/about"（nginx 实测为 404）。
+func normalizePath(urlPath string) string {
 	if !strings.HasPrefix(urlPath, "/") {
 		urlPath = "/" + urlPath
 	}
-	trailing := strings.HasSuffix(urlPath, "/")
-	clean := path.Clean(urlPath)
-	if trailing && clean != "/" {
-		clean += "/"
+	trailing := strings.HasSuffix(urlPath, "/") ||
+		strings.HasSuffix(urlPath, "/.") ||
+		strings.HasSuffix(urlPath, "/..")
+
+	segments := make([]string, 0, 8)
+	for _, segment := range strings.Split(urlPath, "/") {
+		switch segment {
+		case "", ".":
+			continue
+		case "..":
+			if len(segments) > 0 {
+				segments = segments[:len(segments)-1]
+			}
+		default:
+			segments = append(segments, segment)
+		}
 	}
-	return clean
+
+	normalized := "/" + strings.Join(segments, "/")
+	if trailing && normalized != "/" {
+		normalized += "/"
+	}
+	return normalized
 }
 
 // absoluteDirs 把相对目录列表解析为相对 root 的绝对路径。

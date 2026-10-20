@@ -86,39 +86,42 @@ func TestResolve(t *testing.T) {
 	tests := []struct {
 		path       string
 		wantKind   RouteKind
-		wantTarget string // RouteRedirect 的目标 URL 或 RoutePage 的模板名
+		wantTarget string // RoutePage 时的模板名
 	}{
+		// $uri 命中真实文件（与 nginx 实测一致）。
 		{path: "/", wantKind: RoutePage, wantTarget: "index"},
 		{path: "/index.html", wantKind: RoutePage, wantTarget: "index"},
-		// 同一个页面的多种写法都直接命中，不做任何重定向。
 		{path: "/about.html", wantKind: RoutePage, wantTarget: "about"},
-		{path: "/about", wantKind: RoutePage, wantTarget: "about"},
-		{path: "/about/", wantKind: RoutePage, wantTarget: "about"},
-		{path: "/about/index.html", wantKind: RoutePage, wantTarget: "about"},
-		// 目录 index 页。
-		{path: "/help/", wantKind: RoutePage, wantTarget: "help/index"},
-		{path: "/help", wantKind: RoutePage, wantTarget: "help/index"},
-		{path: "/help/index.html", wantKind: RoutePage, wantTarget: "help/index"},
-		{path: "/help/74/", wantKind: RoutePage, wantTarget: "help/74"},
-		{path: "/help/74", wantKind: RoutePage, wantTarget: "help/74"},
 		{path: "/help/74.html", wantKind: RoutePage, wantTarget: "help/74"},
-		// 大写扩展名同样按页面处理。
+		{path: "/help/index.html", wantKind: RoutePage, wantTarget: "help/index"},
 		{path: "/UPPER.HTML", wantKind: RoutePage, wantTarget: "UPPER"},
-		{path: "/UPPER", wantKind: RoutePage, wantTarget: "UPPER"},
-		// 只有非规范路径才 301 归一化。
-		{path: "//about//", wantKind: RouteRedirect, wantTarget: "/about/"},
-		{path: "/a/../about", wantKind: RouteRedirect, wantTarget: "/about"},
+		// $uri.html。
+		{path: "/about", wantKind: RoutePage, wantTarget: "about"},
+		{path: "/help/74", wantKind: RoutePage, wantTarget: "help/74"},
+		// $uri/index.html。
+		{path: "/help", wantKind: RoutePage, wantTarget: "help/index"},
+		// 目录写法：$uri 是目录，由 index 规则提供 <目录>/index.html。
+		{path: "/help/", wantKind: RoutePage, wantTarget: "help/index"},
+		// 扁平产物里没有 about/ 目录，严格等效就是 404。
+		{path: "/about/", wantKind: RouteNotFound},
+		{path: "/about/index.html", wantKind: RouteNotFound},
 		// 静态文件直出。
 		{path: "/static/css/a.css", wantKind: RouteFile},
 		{path: "/robots.txt", wantKind: RouteFile},
-		// 局部模板目录整体不可访问。
+		// 非规范路径先静默归一化，再按 try_files 解析（不重定向，与 nginx 实测一致）。
+		{path: "//about//", wantKind: RouteNotFound},
+		{path: "/about//", wantKind: RouteNotFound},
+		{path: "/about/.", wantKind: RouteNotFound},
+		{path: "/a/../about", wantKind: RoutePage, wantTarget: "about"},
+		{path: "/./about", wantKind: RoutePage, wantTarget: "about"},
+		// 局部模板目录与产物目录一律视为不存在。
 		{path: "/templates/header.html", wantKind: RouteNotFound},
 		{path: "/templates/header", wantKind: RouteNotFound},
 		{path: "/templates/data.json", wantKind: RouteNotFound},
 		{path: "/templates/note.txt", wantKind: RouteNotFound},
-		// 产物目录同样不对外提供。
 		{path: "/dist/old.html", wantKind: RouteNotFound},
 		{path: "/dist/old", wantKind: RouteNotFound},
+		// 其余一律 404。
 		{path: "/static/", wantKind: RouteNotFound},
 		{path: "/missing", wantKind: RouteNotFound},
 		{path: "/missing/", wantKind: RouteNotFound},
@@ -131,10 +134,6 @@ func TestResolve(t *testing.T) {
 				t.Fatalf("Resolve(%q).Kind = %v，期望 %v", test.path, route.Kind, test.wantKind)
 			}
 			switch route.Kind {
-			case RouteRedirect:
-				if route.Location != test.wantTarget {
-					t.Fatalf("重定向目标 = %q，期望 %q", route.Location, test.wantTarget)
-				}
 			case RoutePage:
 				if route.Name != test.wantTarget {
 					t.Fatalf("页面模板名 = %q，期望 %q", route.Name, test.wantTarget)
@@ -332,20 +331,26 @@ func TestIgnored(t *testing.T) {
 	}
 }
 
-func TestCanonicalPath(t *testing.T) {
+// TestNormalizePath 覆盖与 nginx 一致（merge_slashes + remove_dot_segments）的路径归一化。
+func TestNormalizePath(t *testing.T) {
 	tests := map[string]string{
-		"":          "/",
-		"/":         "/",
-		"about":     "/about",
-		"/about/":   "/about/",
-		"//about//": "/about/",
-		"/a/../b":   "/b",
-		"/a/./b/":   "/a/b/",
-		"/../etc":   "/etc",
+		"":             "/",
+		"/":            "/",
+		"about":        "/about",
+		"/about/":      "/about/",
+		"//about//":    "/about/",
+		"/about//":     "/about/",
+		"/a/../b":      "/b",
+		"/a/./b/":      "/a/b/",
+		"/../etc":      "/etc",
+		"/./about":     "/about",
+		"/about/.":     "/about/",
+		"/a/b/../../c": "/c",
+		"/../..":       "/",
 	}
 	for input, want := range tests {
-		if got := canonicalPath(input); got != want {
-			t.Fatalf("canonicalPath(%q) = %q，期望 %q", input, got, want)
+		if got := normalizePath(input); got != want {
+			t.Fatalf("normalizePath(%q) = %q，期望 %q", input, got, want)
 		}
 	}
 }

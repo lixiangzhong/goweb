@@ -208,12 +208,14 @@ const rootLongDescription = `goweb 用两个子命令覆盖「本地写页面 �
   局部模板目录（--template，默认 templates）里的 html 只参与模板解析、不产出页面，
   也不能被直接访问；templates/data.json 的顶层对象是所有页面共用的模板数据。
 
-URL 规则（产物跟随源码路径，serve 不做任何重定向）：
-  about.html       -> /about.html，同时也接受 /about、/about/、/about/index.html
-  index.html       -> /
-  help/index.html  -> /help/ 或 /help/index.html
-  除 //x//、/a/../b 这类非规范路径会 301 归一化外，其余写法一律直接 200；
-  未命中页面时按磁盘真实文件直出；其余返回纯文本 404。`
+URL 规则（等效 nginx 的 try_files $uri $uri.html $uri/index.html，零重定向）：
+  about.html       -> /about.html 命中真实文件
+  about            -> /about      由 $uri.html 命中
+  about/           -> 404         扁平产物里没有 about/ 目录
+  help             -> /help       由 $uri/index.html 命中
+  help/            -> /help/      目录存在，由 index 提供
+  非规范路径静默归一化后再解析（//about// -> /about/ -> 404，/a/../about -> 命中）；
+  局部模板目录、产物目录与忽略项一律视为不存在；其余返回纯文本 404。`
 
 const rootExample = `  goweb                        # 等价于 goweb serve，访问 http://localhost:8080/
   goweb --addr :3000           # 换端口

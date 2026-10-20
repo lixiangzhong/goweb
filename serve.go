@@ -54,8 +54,6 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch route := h.site.Resolve(r.URL.Path); route.Kind {
-	case RouteRedirect:
-		http.Redirect(w, r, route.Location, http.StatusMovedPermanently)
 	case RoutePage:
 		h.renderPage(w, route.Name)
 	case RouteFile:

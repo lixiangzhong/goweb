@@ -24,20 +24,20 @@ func TestHandlerRoutes(t *testing.T) {
 		method       string
 		path         string
 		wantStatus   int
-		wantLocation string
 		wantContains string
 	}{
 		{name: "根路径渲染 index", method: http.MethodGet, path: "/", wantStatus: http.StatusOK, wantContains: "INDEX"},
 		{name: "页面真实路径", method: http.MethodGet, path: "/about.html", wantStatus: http.StatusOK, wantContains: "ABOUT"},
 		{name: "无扩展名写法", method: http.MethodGet, path: "/about", wantStatus: http.StatusOK, wantContains: "ABOUT"},
-		{name: "尾斜杠写法", method: http.MethodGet, path: "/about/", wantStatus: http.StatusOK, wantContains: "ABOUT"},
-		{name: "产物式路径写法", method: http.MethodGet, path: "/about/index.html", wantStatus: http.StatusOK, wantContains: "ABOUT"},
-		{name: "局部模板已展开", method: http.MethodGet, path: "/about/", wantStatus: http.StatusOK, wantContains: "SITE-HEADER"},
+		{name: "局部模板已展开", method: http.MethodGet, path: "/about", wantStatus: http.StatusOK, wantContains: "SITE-HEADER"},
 		{name: "index.html 直接命中", method: http.MethodGet, path: "/index.html", wantStatus: http.StatusOK, wantContains: "INDEX"},
 		{name: "目录 index 页面", method: http.MethodGet, path: "/help/", wantStatus: http.StatusOK, wantContains: "HELP-INDEX"},
 		{name: "目录 index 页无斜杠写法", method: http.MethodGet, path: "/help", wantStatus: http.StatusOK, wantContains: "HELP-INDEX"},
-		{name: "子目录页面", method: http.MethodGet, path: "/help/74/", wantStatus: http.StatusOK, wantContains: "HELP-74"},
-		{name: "只有非规范路径才 301", method: http.MethodGet, path: "//about//", wantStatus: http.StatusMovedPermanently, wantLocation: "/about/"},
+		{name: "子目录页面", method: http.MethodGet, path: "/help/74", wantStatus: http.StatusOK, wantContains: "HELP-74"},
+		{name: "扁平产物下没有 about 目录", method: http.MethodGet, path: "/about/", wantStatus: http.StatusNotFound},
+		{name: "扁平产物下没有 about/index.html", method: http.MethodGet, path: "/about/index.html", wantStatus: http.StatusNotFound},
+		{name: "归一化后命中页面", method: http.MethodGet, path: "/a/../about", wantStatus: http.StatusOK, wantContains: "ABOUT"},
+		{name: "归一化后目录不存在", method: http.MethodGet, path: "//about//", wantStatus: http.StatusNotFound},
 		{name: "静态文件直出", method: http.MethodGet, path: "/static/css/a.css", wantStatus: http.StatusOK, wantContains: "body{color:red}"},
 		{name: "根目录静态文件直出", method: http.MethodGet, path: "/robots.txt", wantStatus: http.StatusOK, wantContains: "User-agent"},
 		{name: "局部模板不可访问", method: http.MethodGet, path: "/templates/header.html", wantStatus: http.StatusNotFound},
@@ -47,7 +47,7 @@ func TestHandlerRoutes(t *testing.T) {
 		{name: "未知路径 404", method: http.MethodGet, path: "/missing", wantStatus: http.StatusNotFound},
 		{name: "未知目录 404", method: http.MethodGet, path: "/missing/", wantStatus: http.StatusNotFound},
 		{name: "非 GET/HEAD 方法拒绝", method: http.MethodPost, path: "/about/", wantStatus: http.StatusMethodNotAllowed},
-		{name: "HEAD 允许", method: http.MethodHead, path: "/about/", wantStatus: http.StatusOK},
+		{name: "HEAD 允许", method: http.MethodHead, path: "/about", wantStatus: http.StatusOK},
 	}
 
 	for _, test := range tests {
@@ -58,11 +58,6 @@ func TestHandlerRoutes(t *testing.T) {
 
 			if recorder.Code != test.wantStatus {
 				t.Fatalf("%s %s 状态码 = %d，期望 %d", test.method, test.path, recorder.Code, test.wantStatus)
-			}
-			if test.wantLocation != "" {
-				if got := recorder.Header().Get("Location"); got != test.wantLocation {
-					t.Fatalf("%s %s Location = %q，期望 %q", test.method, test.path, got, test.wantLocation)
-				}
 			}
 			if test.wantContains != "" && !strings.Contains(recorder.Body.String(), test.wantContains) {
 				t.Fatalf("%s %s 响应缺少 %q：%s", test.method, test.path, test.wantContains, recorder.Body.String())
