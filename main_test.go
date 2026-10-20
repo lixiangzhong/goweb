@@ -220,3 +220,132 @@ func TestRootWithoutSubcommandRunsServe(t *testing.T) {
 		t.Fatalf("错误不是来自 serve 的站点加载: %v", err)
 	}
 }
+
+// TestCommandFlagDefaults 锁定各子命令的默认参数值，避免无意改默认行为。
+func TestCommandFlagDefaults(t *testing.T) {
+	root := newRootCommand()
+
+	if got, err := root.Flags().GetString("addr"); err != nil || got != defaultAddr {
+		t.Fatalf("根命令 --addr 默认值 = %q（err=%v），期望 %q", got, err, defaultAddr)
+	}
+	for flag, want := range map[string]string{"dir": defaultPageDir, "template": defaultTemplateDir} {
+		got, err := root.PersistentFlags().GetString(flag)
+		if err != nil || got != want {
+			t.Fatalf("持久参数 --%s 默认值 = %q（err=%v），期望 %q", flag, got, err, want)
+		}
+	}
+
+	genCmd, _, err := root.Find([]string{"gen"})
+	if err != nil {
+		t.Fatalf("查找 gen: %v", err)
+	}
+	if got, err := genCmd.Flags().GetString("out"); err != nil || got != defaultOutDir {
+		t.Fatalf("gen --out 默认值 = %q（err=%v），期望 %q", got, err, defaultOutDir)
+	}
+	if got, err := genCmd.Flags().GetBool("clean"); err != nil || !got {
+		t.Fatalf("gen --clean 默认值 = %v（err=%v），期望 true", got, err)
+	}
+}
+
+// TestVersionFlagUsesInjectedVersion 覆盖构建时用 -ldflags 注入版本号后的 --version 输出。
+func TestVersionFlagUsesInjectedVersion(t *testing.T) {
+	original := version
+	version = "v9.9.9-test"
+	t.Cleanup(func() { version = original })
+
+	stdout, _, err := executeCLI("--version")
+	if err != nil {
+		t.Fatalf("--version 出错: %v", err)
+	}
+	if !strings.Contains(stdout, "v9.9.9-test") {
+		t.Fatalf("--version 未使用注入的版本号: %s", stdout)
+	}
+}
+
+// TestGenWithoutTemplateDir 覆盖 --template 置空：没有模板目录时不加载数据、templates/ 变成普通目录。
+func TestGenWithoutTemplateDir(t *testing.T) {
+	siteDir := writeSite(t, map[string]string{
+		"index.html":          "<html>{{.site.title}}</html>",
+		"templates/data.json": `{"site":{"title":"IGNORED"}}`,
+	})
+	out := filepath.Join(t.TempDir(), "out")
+
+	if _, stderr, err := executeCLI("gen", "--dir", siteDir, "--template", "", "--out", out); err != nil {
+		t.Fatalf("gen 出错: %v（stderr: %s）", err, stderr)
+	}
+	if got := readFile(t, filepath.Join(out, "index.html")); got != "<html></html>" {
+		t.Fatalf("没有模板目录时不应加载数据，产物 = %q", got)
+	}
+	// templates/ 不再是模板目录，其中的文件按静态资源拷贝。
+	if _, err := os.Stat(filepath.Join(out, "templates", "data.json")); err != nil {
+		t.Fatalf("没有模板目录时 templates/ 应作为普通目录拷贝: %v", err)
+	}
+}
+
+// TestErrorOutputUsesGowebPrefix 覆盖统一错误前缀与 usage 输出。
+// 注意 cobra 的 usage 走 OutOrStderr：真实进程（未设置 Out）落在标准错误，
+// 进程内测试设置了 Out，因此这里合并两路输出一起断言。
+func TestErrorOutputUsesGowebPrefix(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "未知子命令", args: []string{"bogus"}, want: "unknown command"},
+		{name: "未知参数", args: []string{"gen", "--bogus"}, want: "unknown flag"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stdout, stderr, err := executeCLI(test.args...)
+			if err == nil {
+				t.Fatalf("%v 应当报错", test.args)
+			}
+			if !strings.Contains(stderr, "goweb:") {
+				t.Fatalf("错误缺少 goweb: 前缀: %s", stderr)
+			}
+			if !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("错误信息 = %q，期望包含 %q", err.Error(), test.want)
+			}
+			if combined := stdout + stderr; !strings.Contains(combined, "Usage:") {
+				t.Fatalf("参数错误应打印 usage: %s", combined)
+			}
+		})
+	}
+}
+
+// TestHelpGoesToStdout 覆盖帮助输出到标准输出（而不是标准错误）。
+func TestHelpGoesToStdout(t *testing.T) {
+	stdout, stderr, err := executeCLI("gen", "--help")
+	if err != nil {
+		t.Fatalf("--help 不应报错: %v", err)
+	}
+	for _, want := range []string{"--out", "--clean", "--dir", "Examples:"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("帮助缺少 %q：%s", want, stdout)
+		}
+	}
+	if stderr != "" {
+		t.Fatalf("帮助不应写到标准错误: %s", stderr)
+	}
+}
+
+// TestServeFailsOnInvalidAddr 覆盖 serve 在监听失败时的错误路径（站点加载与监听器都要先就绪）。
+func TestServeFailsOnInvalidAddr(t *testing.T) {
+	siteDir := writeSite(t, map[string]string{"index.html": "<html>INDEX</html>"})
+
+	_, _, err := executeCLI("serve", "--dir", siteDir, "--addr", "127.0.0.1:-1")
+	if err == nil {
+		t.Fatal("非法监听地址应当报错")
+	}
+	if !strings.Contains(err.Error(), "invalid port") {
+		t.Fatalf("错误信息不像监听失败: %v", err)
+	}
+}
+
+// TestNewLoggerAcceptsNilWriter 覆盖未指定输出时的默认行为。
+func TestNewLoggerAcceptsNilWriter(t *testing.T) {
+	if logger := newLogger(nil); logger == nil {
+		t.Fatal("newLogger(nil) 不应返回 nil")
+	}
+}

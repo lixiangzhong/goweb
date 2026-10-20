@@ -126,3 +126,115 @@ func waitForRender(t *testing.T, site *Site, name, want string) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// TestHandlerRenderError 覆盖渲染失败：返回 500，把原因写回浏览器，并记录错误日志。
+func TestHandlerRenderError(t *testing.T) {
+	handler, logs := newHandlerWithLog(loadTestSite(t, map[string]string{
+		"bad.html": `<html>{{template "missing" .}}</html>`,
+	}))
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/bad", nil))
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("状态码 = %d，期望 500", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), "渲染失败") {
+		t.Fatalf("响应未说明渲染失败: %s", recorder.Body.String())
+	}
+	if !strings.Contains(logs.String(), "渲染页面失败") {
+		t.Fatalf("日志中缺少渲染失败记录: %s", logs.String())
+	}
+}
+
+// TestHandlerAccessLog 覆盖访问日志：方法、路径与状态码都要落到日志里。
+func TestHandlerAccessLog(t *testing.T) {
+	handler, logs := newHandlerWithLog(loadTestSite(t, testSiteFiles()))
+
+	for _, path := range []string{"/about", "/missing"} {
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, nil))
+	}
+
+	log := logs.String()
+	for _, want := range []string{"method=GET", "path=/about", "status=200", "path=/missing", "status=404"} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("访问日志缺少 %q：%s", want, log)
+		}
+	}
+}
+
+// TestHandlerHeadOnStaticFile 覆盖静态文件的 HEAD 请求：状态码与头正常、无响应体。
+func TestHandlerHeadOnStaticFile(t *testing.T) {
+	handler := newTestHandler(loadTestSite(t, testSiteFiles()))
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodHead, "/static/css/a.css", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200", recorder.Code)
+	}
+	if body := recorder.Body.String(); body != "" {
+		t.Fatalf("HEAD 不应返回响应体：%q", body)
+	}
+	if got := recorder.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/css") {
+		t.Fatalf("Content-Type = %q，期望 text/css", got)
+	}
+}
+
+// TestWatchKeepsServingAfterBrokenTemplate 覆盖监听链路里的失败重载分支：
+// 坏模板下继续提供上一份可用页面，并在日志里报错。
+func TestWatchKeepsServingAfterBrokenTemplate(t *testing.T) {
+	dir := writeSite(t, map[string]string{"about.html": "<html>OLD</html>"})
+	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates"})
+	if err != nil {
+		t.Fatalf("LoadSite: %v", err)
+	}
+
+	logs := new(syncBuffer)
+	stop, err := watchSite(site, slog.New(slog.NewTextHandler(logs, nil)))
+	if err != nil {
+		t.Fatalf("watchSite: %v", err)
+	}
+	defer stop()
+
+	writeFile(t, filepath.Join(dir, "about.html"), "<html>{{template ")
+	waitFor(t, 5*time.Second, func() bool {
+		return strings.Contains(logs.String(), "站点重载失败")
+	}, "坏模板应在日志里报重载失败")
+
+	body, err := site.Render("about")
+	if err != nil {
+		t.Fatalf("坏模板下应继续提供旧页面: %v", err)
+	}
+	if !strings.Contains(string(body), "OLD") {
+		t.Fatalf("旧页面内容丢失: %s", body)
+	}
+}
+
+// TestWatchNoticesNewFiles 覆盖新增文件也能被监听：新页面出现后重载即可渲染。
+func TestWatchNoticesNewFiles(t *testing.T) {
+	dir := writeSite(t, map[string]string{"index.html": "<html>INDEX</html>"})
+	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates"})
+	if err != nil {
+		t.Fatalf("LoadSite: %v", err)
+	}
+
+	stop, err := watchSite(site, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("watchSite: %v", err)
+	}
+	defer stop()
+
+	writeFile(t, filepath.Join(dir, "docs", "new.html"), "<html>NEW-PAGE</html>")
+	waitFor(t, 5*time.Second, func() bool {
+		return site.hasPage("docs/new")
+	}, "新增页面应被重载发现")
+
+	body, err := site.Render("docs/new")
+	if err != nil {
+		t.Fatalf("渲染新页面: %v", err)
+	}
+	if !strings.Contains(string(body), "NEW-PAGE") {
+		t.Fatalf("新页面内容不正确: %s", body)
+	}
+}

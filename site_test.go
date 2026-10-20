@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -353,4 +354,165 @@ func TestNormalizePath(t *testing.T) {
 			t.Fatalf("normalizePath(%q) = %q，期望 %q", input, got, want)
 		}
 	}
+}
+
+// TestLoadSiteOptions 覆盖目录约定的边界：没有模板目录、排除目录支持相对与绝对路径。
+func TestLoadSiteOptions(t *testing.T) {
+	dir := writeSite(t, testSiteFiles())
+
+	t.Run("没有模板目录", func(t *testing.T) {
+		site, err := LoadSite(SiteOptions{Dir: dir})
+		if err != nil {
+			t.Fatalf("LoadSite: %v", err)
+		}
+		if got := site.DataFile(); got != "" {
+			t.Fatalf("未配置模板目录时数据文件应为空，实际 %q", got)
+		}
+		// 没有模板目录时 templates/ 只是普通目录，里面的 html 也算页面。
+		if !site.hasPage("templates/header") {
+			t.Fatal("没有模板目录时 templates/header.html 应成为页面")
+		}
+	})
+
+	t.Run("排除目录支持相对与绝对路径", func(t *testing.T) {
+		site, err := LoadSite(SiteOptions{
+			Dir:         dir,
+			TemplateDir: "templates",
+			ExcludeDirs: []string{"static", filepath.Join(dir, "help")},
+		})
+		if err != nil {
+			t.Fatalf("LoadSite: %v", err)
+		}
+		for _, page := range []string{"help/74", "help/index"} {
+			if site.hasPage(page) {
+				t.Fatalf("被排除目录里的 %s 不应成为页面", page)
+			}
+		}
+		if route := site.Resolve("/static/css/a.css"); route.Kind != RouteNotFound {
+			t.Fatalf("被排除目录里的静态文件不应对外提供，实际 %v", route.Kind)
+		}
+	})
+}
+
+// TestDataFileTopLevelNull 覆盖 data.json 为 null：视为没有数据而不是报错。
+func TestDataFileTopLevelNull(t *testing.T) {
+	site := loadTestSite(t, map[string]string{
+		"index.html":          `<p>[{{.site.title}}]</p>`,
+		"templates/data.json": `null`,
+	})
+
+	body, err := site.Render("index")
+	if err != nil {
+		t.Fatalf("渲染: %v", err)
+	}
+	if string(body) != "<p>[]</p>" {
+		t.Fatalf("渲染结果 = %q，期望 %q", body, "<p>[]</p>")
+	}
+}
+
+// TestWatchPaths 覆盖监听路径集合：页面、局部模板与静态资源都要监听，忽略项不监听。
+func TestWatchPaths(t *testing.T) {
+	site := loadTestSite(t, testSiteFiles())
+	paths, err := site.WatchPaths()
+	if err != nil {
+		t.Fatalf("WatchPaths: %v", err)
+	}
+	watched := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		watched[path] = true
+	}
+
+	root := site.Root()
+	mustWatch := []string{
+		root,
+		filepath.Join(root, "index.html"),
+		filepath.Join(root, "help", "74.html"),
+		// 局部模板与数据变更同样要触发重载。
+		filepath.Join(root, "templates", "header.html"),
+		filepath.Join(root, "templates", "data.json"),
+		filepath.Join(root, "static", "css", "a.css"),
+	}
+	for _, path := range mustWatch {
+		if !watched[path] {
+			t.Fatalf("监听路径缺少 %s", path)
+		}
+	}
+
+	mustSkip := []string{
+		filepath.Join(root, "node_modules", "pkg", "a.html"),
+		filepath.Join(root, ".hidden", "secret.html"),
+		filepath.Join(root, "dist", "old.html"),
+	}
+	for _, path := range mustSkip {
+		if watched[path] {
+			t.Fatalf("监听路径不应包含 %s", path)
+		}
+	}
+}
+
+// TestWithinTemplateDir 覆盖模板目录判定，尤其是同前缀目录不能误判。
+func TestWithinTemplateDir(t *testing.T) {
+	site := loadTestSite(t, testSiteFiles())
+	root := site.Root()
+
+	tests := map[string]bool{
+		filepath.Join(root, "templates"):                 true,
+		filepath.Join(root, "templates", "header.html"):  true,
+		filepath.Join(root, "templates2", "header.html"): false,
+		filepath.Join(root, "about.html"):                false,
+	}
+	for path, want := range tests {
+		if got := site.WithinTemplateDir(path); got != want {
+			t.Fatalf("WithinTemplateDir(%q) = %v，期望 %v", path, got, want)
+		}
+	}
+
+	// 没有模板目录时任何路径都不算模板文件。
+	plain, err := LoadSite(SiteOptions{Dir: root})
+	if err != nil {
+		t.Fatalf("LoadSite: %v", err)
+	}
+	if plain.WithinTemplateDir(filepath.Join(root, "templates", "header.html")) {
+		t.Fatal("没有模板目录时不应判定为模板文件")
+	}
+}
+
+// TestRenderConcurrentWithReload 覆盖渲染与热重载并发（配合 -race 检查数据竞争）。
+func TestRenderConcurrentWithReload(t *testing.T) {
+	dir := writeSite(t, map[string]string{
+		"index.html":          `<p>{{.site.title}}</p>`,
+		"templates/data.json": `{"site":{"title":"T0"}}`,
+	})
+	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates"})
+	if err != nil {
+		t.Fatalf("LoadSite: %v", err)
+	}
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				if _, err := site.Render("index"); err != nil {
+					t.Errorf("并发渲染失败: %v", err)
+					return
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < 20; i++ {
+		if err := site.Reload(); err != nil {
+			t.Fatalf("Reload: %v", err)
+		}
+	}
+	close(done)
+	wg.Wait()
 }

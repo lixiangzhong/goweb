@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -166,5 +167,113 @@ func TestGenerateFailsFastOnBrokenPage(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(out, "bad", "index.html")); err == nil {
 		t.Fatal("渲染失败的页面不应留下产物")
+	}
+}
+
+// TestGenerateAssets 覆盖资源拷贝的边界：嵌套目录、符号链接、忽略项。
+func TestGenerateAssets(t *testing.T) {
+	dir := writeSite(t, map[string]string{
+		"index.html":           "<html>INDEX</html>",
+		"static/css/site.css":  "body{}",
+		"static/deep/a/b.txt":  "deep",
+		"assets/logo.svg":      "<svg/>",
+		"node_modules/x/a.css": "dep",
+		".hidden/secret.css":   "hidden",
+		"templates/data.json":  `{"k":"v"}`,
+		"templates/note.txt":   "note",
+	})
+
+	// 指向文件的符号链接按内容拷贝；指向目录的符号链接跳过（避免逃出站点或成环）。
+	if err := os.Symlink(filepath.Join(dir, "assets", "logo.svg"), filepath.Join(dir, "static", "logo-link.svg")); err != nil {
+		t.Skipf("当前环境不支持符号链接: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "assets"), filepath.Join(dir, "static", "assets-link")); err != nil {
+		t.Skipf("当前环境不支持符号链接: %v", err)
+	}
+
+	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates", ExcludeDirs: []string{"dist"}})
+	if err != nil {
+		t.Fatalf("LoadSite: %v", err)
+	}
+
+	logs := new(syncBuffer)
+	result, err := Generate(site, GenOptions{
+		Out:    filepath.Join(dir, "dist"),
+		Clean:  true,
+		Logger: slog.New(slog.NewTextHandler(logs, nil)),
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	want := []string{
+		"assets/logo.svg",
+		"index.html",
+		"static/css/site.css",
+		"static/deep/a/b.txt",
+		"static/logo-link.svg",
+	}
+	if got := listFiles(t, filepath.Join(dir, "dist")); !equalStrings(got, want) {
+		t.Fatalf("产物清单 = %v，期望 %v", got, want)
+	}
+	if result.Assets != 4 {
+		t.Fatalf("资源数 = %d，期望 4", result.Assets)
+	}
+	if !strings.Contains(logs.String(), "跳过指向目录的符号链接") {
+		t.Fatalf("日志中缺少跳过符号链接目录的记录: %s", logs.String())
+	}
+}
+
+// TestGenerateCleanMissingOutDir 覆盖产物目录不存在时 clean 不报错。
+func TestGenerateCleanMissingOutDir(t *testing.T) {
+	dir := writeSite(t, map[string]string{"index.html": "<html>INDEX</html>"})
+	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates"})
+	if err != nil {
+		t.Fatalf("LoadSite: %v", err)
+	}
+
+	out := filepath.Join(dir, "dist")
+	if _, err := Generate(site, GenOptions{Out: out, Clean: true}); err != nil {
+		t.Fatalf("产物目录不存在时 clean 应直接跳过: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "index.html")); err != nil {
+		t.Fatalf("产物未生成: %v", err)
+	}
+}
+
+// TestGenerateFailsWhenOutIsFile 覆盖产物路径被普通文件占用的错误路径。
+func TestGenerateFailsWhenOutIsFile(t *testing.T) {
+	dir := writeSite(t, map[string]string{"index.html": "<html>INDEX</html>"})
+	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates"})
+	if err != nil {
+		t.Fatalf("LoadSite: %v", err)
+	}
+
+	blocked := filepath.Join(dir, "blocked")
+	if err := os.WriteFile(blocked, []byte("x"), 0o644); err != nil {
+		t.Fatalf("写入占位文件: %v", err)
+	}
+	if _, err := Generate(site, GenOptions{Out: blocked, Clean: true}); err == nil {
+		t.Fatal("产物目录被文件占用时应当报错")
+	}
+}
+
+// TestGenerateFailsWhenTargetIsDirectory 覆盖拷贝目标被目录占用的错误路径。
+func TestGenerateFailsWhenTargetIsDirectory(t *testing.T) {
+	dir := writeSite(t, map[string]string{
+		"index.html":   "<html>INDEX</html>",
+		"static/a.css": "body{}",
+	})
+	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates"})
+	if err != nil {
+		t.Fatalf("LoadSite: %v", err)
+	}
+
+	out := filepath.Join(dir, "dist")
+	if err := os.MkdirAll(filepath.Join(out, "static", "a.css"), 0o755); err != nil {
+		t.Fatalf("预置同名目录: %v", err)
+	}
+	if _, err := Generate(site, GenOptions{Out: out, Clean: false}); err == nil {
+		t.Fatal("拷贝目标被目录占用时应当报错")
 	}
 }
