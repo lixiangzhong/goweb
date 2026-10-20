@@ -63,6 +63,19 @@ go build -o goweb .
 go build -ldflags "-X main.version=$(git describe --tags --always --dirty)" -o goweb .
 ```
 
+### 预编译二进制
+
+[Releases](https://github.com/lixiangzhong/goweb/releases) 由 GoReleaser 在推 `v*` 标签时自动构建：
+
+| 平台 | 架构 | 归档 |
+| --- | --- | --- |
+| macOS | Intel / Apple Silicon | `goweb_<版本>_darwin_{amd64,arm64}.tar.gz` |
+| Linux | x86_64 / arm64 | `goweb_<版本>_linux_{amd64,arm64}.tar.gz` |
+
+每个 Release 附带 `checksums.txt`。
+
+暂时**不提供 Windows 二进制**：Windows 只进 CI 测试矩阵（保证代码能在 Windows 上跑通），但没有验证过实际使用行为，因此不发布未验证的可执行文件。Windows 用户可以用 `go install` 自行构建。
+
 ## 快速开始
 
 ```bash
@@ -367,7 +380,16 @@ go test -short -cover ./...   # 覆盖率
 
 测试质量本身经过故障注入验证：分别破坏模板目录隔离、尾斜杠语义、产物目录护栏与解析错误处理，对应测试都会立刻变红。
 
-CI 在 Ubuntu 与 macOS 上运行 `gofmt` 检查、`go mod tidy` 校验、`go vet`、单元测试（`-race` + 覆盖率）与端到端测试。
+CI 在 Ubuntu、macOS 与 Windows 上运行 `gofmt` 检查、`go mod tidy` 校验、`go vet`、单元测试（带覆盖率，`-race` 只在 Linux/macOS 跑）与端到端测试。
+
+### 发布
+
+推一个 `v*` 标签即触发 [release.yml](.github/workflows/release.yml)：先在 Ubuntu 上跑完整测试，再由 GoReleaser 按 [.goreleaser.yaml](.goreleaser.yaml) 交叉编译 macOS/Linux 的 amd64 与 arm64、生成 `checksums.txt` 并创建 GitHub Release。
+
+```bash
+# 本地预演一次完整打包（产物落在 dist/，不会发布）
+goreleaser release --snapshot --clean
+```
 
 ## 贡献
 
