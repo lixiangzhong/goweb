@@ -23,6 +23,7 @@
 - [模板](#模板)
 - [模板数据](#模板数据)
 - [URL 规则](#url-规则)
+- [浏览器热重载](#浏览器热重载)
 - [生成静态站](#生成静态站)
 - [部署](#部署)
 - [命令与参数](#命令与参数)
@@ -39,7 +40,7 @@
 - **开发服务器等效 `try_files`**：解析顺序就是 nginx 的 `try_files $uri $uri.html $uri/index.html`，零重定向；本地结果与用同一行配置部署的线上结果逐条一致（含 404）。
 - **复用页头页脚**：直接用 Go 的 `html/template`，`{{define}}` + `{{template}}` 抽公共片段，不需要学新语法。
 - **站点级数据**：`templates/data.json` 提供站名、备案号、导航等共享变量，页面与局部模板都能取。
-- **保存即可见**：模板、页面或数据文件变更后自动重新加载，浏览器刷新即可；改到一半的坏模板不会让服务挂掉。
+- **保存即可见**：页面、模板、`data.json` 或静态资源变更后自动重载，并通过 SSE 让浏览器自动刷新；改到一半的坏模板不会让服务挂掉，也不会触发刷新。
 - **一条命令静态化**：`goweb gen` 原地产出 `dist/`，其余文件原样拷贝。
 - **危险操作有护栏**：清空产物目录前会拦截页面目录本身、其父目录、局部模板目录与用户主目录。
 - **快速失败**：任一页面渲染失败即整体失败、非零退出，绝不把半成品产物当成成功发布。
@@ -237,6 +238,7 @@ dist/static/css/site.css
 | `//about//` | 归一化成 `/about/` | 404 | 404 | 404 | 404 |
 | `/a/../about` | 归一化成 `/about` | 200 | 200 | 200 | 200 |
 | `/templates/*`、`/dist/*` | 忽略项视为不存在 | 404 | 404 | 404 | 404 |
+| `/__goweb/livereload` | 热重载 SSE 端点（保留路径） | 200（`--livereload=false` 时为 404） | — | — | — |
 | 其他 | 都不命中 | 纯文本 `404` | 404 | 404 | 404 |
 
 要点：
@@ -245,8 +247,26 @@ dist/static/css/site.css
 - 非规范路径（`//about//`、`/a/../about`、`/about/.`）**静默归一化，不重定向**，与 nginx 的 `merge_slashes` + `remove_dot_segments` 行为一致。
 - 局部模板目录、产物目录、隐藏项与 `node_modules` 一律视为不存在，与产物内容保持一致。
 - 因此**站内链接写 `/about.html` 最稳**（任何托管都必然可用）；想让无扩展名写法在线上也可用，见[部署](#部署)里的那一行 `try_files`。
+- `/__goweb/` 是 goweb 的保留前缀，站点里同名文件会让位给内置端点。
 
 非 GET/HEAD 请求返回 `405`；开发期响应带 `Cache-Control: no-store`，避免改完文件被浏览器旧副本挡住。
+
+## 浏览器热重载
+
+`goweb serve` 默认开启浏览器热重载：站点文件一改，浏览器自己刷新，不用手动按 F5。
+
+```
+站点文件变更 ──fsnotify──▶ 防抖 150ms ──▶ 重载模板与 data.json
+                                              │ 成功
+                                              ▼
+                        广播到 /__goweb/livereload ──SSE──▶ 页面 location.reload()
+```
+
+- **注入只在 serve**：页面 HTML 在 `</body>` 之前被插入一小段脚本（带 `data-goweb-livereload` 标记），`goweb gen` 的产物**不含任何脚本**——有测试保证。
+- **端点**：`GET /__goweb/livereload`，`text/event-stream`，20 秒发一次保活注释；断线由浏览器自动重连。
+- **触发范围**：页面、局部模板、`templates/data.json`、css/js/图片等任何被监听的站点文件；变更一律整页刷新（不做 CSS 热替换）。
+- **只在成功时刷新**：模板改到一半（语法错误）时服务端保留上一份可用内容、终端打印错误，但**不**通知浏览器刷新——避免刷新后看到的还是旧内容而误以为没生效。
+- **关掉它**：`goweb serve --livereload=false`（`-l=false`）。关闭后不注入脚本、端点返回 404，开发时看到的 HTML 与线上产物完全一致。
 
 ## 生成静态站
 
@@ -318,6 +338,7 @@ goweb --version
 | `--template` | `-t` | 全部 | `templates` | 局部模板目录（相对页面目录），`data.json` 也在其中；置空表示没有 |
 | `--out` | `-o` | gen | `dist` | 产物目录 |
 | `--clean` | `-c` | gen | `true` | 生成前清空产物目录 |
+| `--livereload` | `-l` | serve（含不带子命令） | `true` | 注入热重载脚本并开放 SSE 端点；`--livereload=false` 关闭 |
 | `--version` | `-v` | 根命令（`goweb --version`） | — | 打印版本号（`dev`，除非构建时用 `-ldflags` 注入） |
 | `--help` | `-h` | 全部 | — | 查看帮助，如 `goweb gen --help` |
 
@@ -332,15 +353,15 @@ goweb completion zsh > "${fpath[1]}/_goweb"
 - **开发服务器等效 `try_files`**：解析顺序就是 `try_files $uri $uri.html $uri/index.html`，零重定向、不做 URL 重写；本地结果与用同一行配置部署的线上结果逐条一致（`/about` 能开、`/about/` 404 都一致），站内链接写 `/about.html` 最稳。
 - **单一 `html/template` 命名空间**：所有页面与局部模板一起解析，`{{template "x" .}}` 全局可用；代价是不同文件里同名 `define` 会互相覆盖。
 - **不做缺键校验**：JSON 直接解成 map 当模板数据，缺键渲染成空串而不是报错，实现最简且不会误伤 `range`/`with` 内部取值；代价是拼错键名会静默留白。
-- **开发期不做浏览器热刷新**：只重载模板与数据，不注入任何脚本，`gen` 产物因此天然干净。
+- **浏览器热重载是可选的注入**：`serve` 默认注入刷新脚本，`gen` 产物永远干净；用 `--livereload=false` 可让开发时看到的 HTML 与线上完全一致。
 - **渲染失败即失败**：宁可让 `gen` 报错退出，也不产出一个缺页面的半成品静态站。
 - **用 cobra 而不是标准库 `flag`**：换来统一的 `--help`/`--version`/shell 补全与更清晰的子命令结构，代价是多两个间接依赖（pflag、mousetrap）；公共参数（`--dir`/`--template`）做成 persistent flag，保证 `goweb --dir site gen` 不会被静默忽略。
 
 ## 目前不做
 
-浏览器热刷新（SSE 注入）、CSS 热替换、自定义 404 页面、多语言（i18n）、资源内容哈希/指纹、每页独立数据（只提供站点级 `data.json`）。
+CSS 热替换（改样式仍整页刷新）、自定义 404 页面、多语言（i18n）、资源内容哈希/指纹、每页独立数据（只提供站点级 `data.json`）。
 
-模板与 `data.json` 变更后自动重载，浏览器手动刷新即可。
+页面、模板、`data.json` 与静态资源变更后都会自动重载，并通过热重载让浏览器自动刷新。
 
 ## 开发
 
@@ -372,9 +393,10 @@ go test -short -cover ./...   # 覆盖率
 | --- | --- | --- |
 | `site_test.go` | `LoadSite` / `Reload` / `Render` / `Resolve` / `WatchPaths` | 页面发现与忽略规则、try_files 三候选顺序与路径归一化、data.json 语义、坏模板保留上一版、并发渲染与重载 |
 | `gen_test.go` | `Generate` | 产物树、资源拷贝（嵌套目录/符号链接/忽略项）、清空护栏、快速失败、错误路径 |
-| `serve_test.go` | `newHandler` / `watchSite` | 状态码与响应头、访问日志、渲染失败回 500、fsnotify 重载与失败韧性、新增文件被发现 |
+| `serve_test.go` | `newHandler` / `watchSite` | 状态码与响应头、访问日志、渲染失败回 500、fsnotify 重载与失败韧性、新增文件被发现、热重载注入范围与广播时机 |
+| `livereload_test.go` | `liveReloadHub` / `injectLiveReload` | 脚本注入位置（`</body>` 前/追加/大小写）、订阅与注销、慢客户端不阻塞广播 |
 | `main_test.go` | cobra 命令树 | 参数默认值与短选项、公共参数前置、错误前缀与 usage、`--version` 注入 |
-| `e2e_test.go` | **真实二进制 + 真实 HTTP** | 编译 goweb → 跑 `gen`（产物清单、幂等、护栏退出码、坏数据失败）与 `serve`（全部 URL 语义、405/404、缓存头、热重载、坏模板韧性、`--version`/`help`/`completion`） |
+| `e2e_test.go` | **真实二进制 + 真实 HTTP** | 编译 goweb → 跑 `gen`（产物清单、幂等、护栏退出码、坏数据失败、产物不含热重载脚本）与 `serve`（全部 URL 语义、405/404、缓存头、SSE 推送刷新事件、`--livereload=false`、坏模板韧性、`--version`/`help`/`completion`） |
 
 端到端测试用 `--addr 127.0.0.1:0` 让内核分配端口，再从启动日志里读回真实地址，因此不会与并行任务抢端口；`go test -short` 会跳过它（需要编译与监听）。
 
