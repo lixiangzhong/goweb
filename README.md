@@ -72,10 +72,15 @@ go build -ldflags "-X main.version=$(git describe --tags --always --dirty)" -o g
 | --- | --- | --- |
 | macOS | Intel / Apple Silicon | `goweb_<版本>_darwin_{amd64,arm64}.tar.gz` |
 | Linux | x86_64 / arm64 | `goweb_<版本>_linux_{amd64,arm64}.tar.gz` |
+| Windows | x64 | `goweb_<版本>_windows_amd64.zip`（内含 `goweb.exe`） |
 
 每个 Release 附带 `checksums.txt`。
 
-暂时**不提供 Windows 二进制**：Windows 只进 CI 测试矩阵（保证代码能在 Windows 上跑通），但没有验证过实际使用行为，因此不发布未验证的可执行文件。Windows 用户可以用 `go install` 自行构建。
+Windows 说明：
+
+- 只提供 **x64（amd64）**：Windows arm64 没有进 CI 测试矩阵，不发布未验证的产物。
+- 二进制**未签名**，首次运行会被 SmartScreen 拦一下，需要手动选「仍要运行」——这是所有未签名开源二进制的通病。
+- Windows 上的行为由 CI 持续验证（单元测试 + 真实 `.exe` 的端到端测试，覆盖热重载与 SSE），但还没有真实 Windows 用户环境的反馈。
 
 ## 快速开始
 
@@ -402,7 +407,7 @@ go test -short -cover ./...   # 覆盖率
 
 测试质量本身经过故障注入验证：分别破坏模板目录隔离、尾斜杠语义、产物目录护栏与解析错误处理，对应测试都会立刻变红。
 
-CI 在 Ubuntu、macOS 与 Windows 上运行 `gofmt` 检查、`go mod tidy` 校验、`go vet`、单元测试（带覆盖率，`-race` 只在 Linux/macOS 跑）与端到端测试。
+CI 在 Ubuntu、macOS 与 Windows 上运行 `gofmt` 检查、`go mod tidy` 校验、`go vet`、单元测试（含覆盖率与竞态检测）与端到端测试。竞态检测需要 C 编译器，镜像里没有时该步骤会打印一条 notice 并跳过（不静默降级）。
 
 ### 发布
 
