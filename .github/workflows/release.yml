@@ -1,0 +1,40 @@
+name: Release
+
+# 推 v* 标签时交叉编译并发布：
+#   goweb_<版本>_{darwin,linux}_{amd64,arm64}.tar.gz + checksums.txt
+# 只发 macOS 与 Linux；Windows 只进 CI 测试矩阵，不发二进制（尚未在 Windows 上验证运行行为）。
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # GoReleaser 需要完整历史来生成 changelog。
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test before release
+        run: go test -count=1 ./...
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
