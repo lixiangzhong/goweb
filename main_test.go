@@ -373,3 +373,82 @@ func TestNewLoggerAcceptsNilWriter(t *testing.T) {
 		t.Fatal("newLogger(nil) 不应返回 nil")
 	}
 }
+
+// TestResolveMode 覆盖 --mode 的解析：auto 按子命令取默认值，显式值原样生效。
+func TestResolveMode(t *testing.T) {
+	tests := []struct {
+		raw        string
+		devCommand bool
+		want       Mode
+	}{
+		{raw: "", devCommand: true, want: ModeDev},
+		{raw: "", devCommand: false, want: ModeProd},
+		{raw: modeAuto, devCommand: true, want: ModeDev},
+		{raw: modeAuto, devCommand: false, want: ModeProd},
+		{raw: "dev", devCommand: false, want: ModeDev},
+		{raw: "prod", devCommand: true, want: ModeProd},
+		{raw: " PROD ", devCommand: true, want: ModeProd},
+	}
+	for _, test := range tests {
+		got, err := resolveMode(test.raw, test.devCommand)
+		if err != nil {
+			t.Fatalf("resolveMode(%q, %v) 出错: %v", test.raw, test.devCommand, err)
+		}
+		if got != test.want {
+			t.Fatalf("resolveMode(%q, %v) = %q，期望 %q", test.raw, test.devCommand, got, test.want)
+		}
+	}
+
+	if _, err := resolveMode("stage", true); err == nil {
+		t.Fatal("不支持的 --mode 取值应当报错")
+	}
+}
+
+// TestParseBuildTime 覆盖 --build-time 的多种写法与非法输入。
+func TestParseBuildTime(t *testing.T) {
+	zero, err := parseBuildTime("")
+	if err != nil || !zero.IsZero() {
+		t.Fatalf("空值应表示由站点推导（零时间），实际 %v err=%v", zero, err)
+	}
+
+	tests := map[string]string{
+		"2026-03-05T10:30:00Z":      "2026-03-05",
+		"2026-03-05T18:30:00+08:00": "2026-03-05",
+		"2026-03-05 10:30:00":       "2026-03-05",
+		"2026-03-05":                "2026-03-05",
+	}
+	for raw, wantDate := range tests {
+		parsed, err := parseBuildTime(raw)
+		if err != nil {
+			t.Fatalf("parseBuildTime(%q) 出错: %v", raw, err)
+		}
+		if got := parsed.Format("2006-01-02"); got != wantDate {
+			t.Fatalf("parseBuildTime(%q) = %s，期望日期 %s", raw, got, wantDate)
+		}
+	}
+
+	if _, err := parseBuildTime("昨天"); err == nil {
+		t.Fatal("无法解析的 --build-time 应当报错")
+	}
+}
+
+// TestModeAndBuildTimeFlags 覆盖两个新参数在各子命令上的默认值与生效路径。
+func TestModeAndBuildTimeFlags(t *testing.T) {
+	root := newRootCommand()
+	if got, err := root.PersistentFlags().GetString("mode"); err != nil || got != modeAuto {
+		t.Fatalf("--mode 默认值 = %q（err=%v），期望 %q", got, err, modeAuto)
+	}
+	if got, err := root.PersistentFlags().GetString("build-time"); err != nil || got != "" {
+		t.Fatalf("--build-time 默认值 = %q（err=%v），期望空", got, err)
+	}
+
+	// 非法取值要在真正干活之前就报错（用坏站点也应是参数错误先出现）。
+	if _, _, err := executeCLI("gen", "--mode", "stage"); err == nil ||
+		!strings.Contains(err.Error(), "--mode") {
+		t.Fatalf("非法 --mode 应报参数错误，实际: %v", err)
+	}
+	if _, _, err := executeCLI("gen", "--build-time", "昨天"); err == nil ||
+		!strings.Contains(err.Error(), "--build-time") {
+		t.Fatalf("非法 --build-time 应报参数错误，实际: %v", err)
+	}
+}

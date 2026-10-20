@@ -2,11 +2,14 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -20,6 +23,8 @@ const (
 	defaultTemplateDir = "templates"
 	// defaultOutDir 是 gen 的默认产物目录。
 	defaultOutDir = "dist"
+	// modeAuto 表示按子命令自动选择渲染模式：serve=dev、gen=prod。
+	modeAuto = "auto"
 )
 
 // version 是版本号，构建时可通过 -ldflags "-X main.version=v1.0.0" 注入。
@@ -29,6 +34,10 @@ var version = "dev"
 type globalOptions struct {
 	dir         string
 	templateDir string
+	// mode 是渲染模式：auto（serve=dev、gen=prod）、dev、prod。
+	mode string
+	// buildTime 是模板里的构建时间（RFC3339 或 2006-01-02）；留空则取站点内容最新的文件修改时间。
+	buildTime string
 }
 
 func main() {
@@ -123,6 +132,41 @@ func addGlobalFlags(cmd *cobra.Command, globals *globalOptions) {
 	flags.StringVarP(&globals.dir, "dir", "d", defaultPageDir, "页面目录")
 	flags.StringVarP(&globals.templateDir, "template", "t", defaultTemplateDir,
 		"局部模板目录（相对页面目录），data.json 也在其中；置空表示没有")
+	flags.StringVar(&globals.mode, "mode", modeAuto,
+		"渲染模式：auto（serve=dev、gen=prod）、dev、prod；模板里用 {{if prod}} 判断")
+	flags.StringVar(&globals.buildTime, "build-time", "",
+		"模板里的构建时间（RFC3339 或 2006-01-02）；留空则取站点内容里最新的文件修改时间")
+}
+
+// resolveMode 把 --mode 的取值解析成实际模式：auto 时 serve 用 dev、gen 用 prod。
+func resolveMode(raw string, devCommand bool) (Mode, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", modeAuto:
+		if devCommand {
+			return ModeDev, nil
+		}
+		return ModeProd, nil
+	case string(ModeDev):
+		return ModeDev, nil
+	case string(ModeProd):
+		return ModeProd, nil
+	default:
+		return "", fmt.Errorf("--mode 只支持 %s、%s、%s，实际是 %q", modeAuto, ModeDev, ModeProd, raw)
+	}
+}
+
+// parseBuildTime 解析 --build-time，留空表示由站点文件推导。
+func parseBuildTime(raw string) (time.Time, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return time.Time{}, nil
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02"} {
+		if parsed, err := time.Parse(layout, trimmed); err == nil {
+			return parsed, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("--build-time 无法解析 %q（支持 RFC3339 / 2006-01-02 15:04:05 / 2006-01-02）", raw)
 }
 
 // serveOptions 是 serve 的参数。
@@ -142,10 +186,21 @@ type genOptions struct {
 // runServe 启动开发服务器。
 func runServe(cmd *cobra.Command, opts serveOptions) error {
 	logger := newLogger(cmd.ErrOrStderr())
+
+	mode, err := resolveMode(opts.globals.mode, true)
+	if err != nil {
+		return err
+	}
+	buildTime, err := parseBuildTime(opts.globals.buildTime)
+	if err != nil {
+		return err
+	}
 	site, err := LoadSite(SiteOptions{
 		Dir:         opts.globals.dir,
 		TemplateDir: opts.globals.templateDir,
 		ExcludeDirs: []string{defaultOutDir},
+		Mode:        mode,
+		BuildTime:   buildTime,
 	})
 	if err != nil {
 		return err
@@ -184,6 +239,8 @@ func runServe(cmd *cobra.Command, opts serveOptions) error {
 		"dir", site.Root(),
 		"pages", len(site.Pages()),
 		"data", site.DataFile(),
+		"mode", site.Mode(),
+		"buildTime", site.BuildTime().Format(time.RFC3339),
 		"livereload", opts.liveReload,
 	)
 	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -195,10 +252,21 @@ func runServe(cmd *cobra.Command, opts serveOptions) error {
 // runGen 渲染全部页面并产出纯静态站。
 func runGen(cmd *cobra.Command, opts genOptions) error {
 	logger := newLogger(cmd.ErrOrStderr())
+
+	mode, err := resolveMode(opts.globals.mode, false)
+	if err != nil {
+		return err
+	}
+	buildTime, err := parseBuildTime(opts.globals.buildTime)
+	if err != nil {
+		return err
+	}
 	site, err := LoadSite(SiteOptions{
 		Dir:         opts.globals.dir,
 		TemplateDir: opts.globals.templateDir,
 		ExcludeDirs: []string{opts.out},
+		Mode:        mode,
+		BuildTime:   buildTime,
 	})
 	if err != nil {
 		return err
@@ -213,6 +281,8 @@ func runGen(cmd *cobra.Command, opts genOptions) error {
 		"pages", result.Pages,
 		"assets", result.Assets,
 		"data", site.DataFile(),
+		"mode", site.Mode(),
+		"buildTime", site.BuildTime().Format(time.RFC3339),
 	)
 	return nil
 }
@@ -242,6 +312,22 @@ const rootLongDescription = `goweb 用两个子命令覆盖「本地写页面 �
     index.html -> /      about.html -> /about/      help/74.html -> /help/74/
   局部模板目录（--template，默认 templates）里的 html 只参与模板解析、不产出页面，
   也不能被直接访问；templates/data.json 的顶层对象是所有页面共用的模板数据。
+
+模板函数（大小写之分即信任边界：大写输出不转义的安全类型）：
+  HTML / JS                                        原样输出 HTML / 值编码为 JSON 字面量
+  {{asset "/static/css/site.css"}}                 -> /static/css/site.css?v=<内容哈希>，文件不存在直接报错
+  {{default "未命名" .site.title}}                 值为空时用兜底值（补「缺键渲染为空」的坑）
+  {{fail "缺少 site.title"}}                       渲染直接失败：gen 退出非零、serve 回 500
+  {{template "card" dict "title" .t "url" .u}}     给局部模板传多个参数；另有 list
+  upper / lower / trimPrefix / trimSuffix / replace / join / truncate / charCount
+                                                  文本工具，长度与截断一律按字符（中文不会被截半）
+  dev / prod / buildTime / year / date             模式与时间
+
+模式与构建时间：
+  --mode auto（默认）时 serve 用 dev、gen 用 prod，也可显式写 --mode dev|prod；
+  模板里 {{if prod}} 常用于「统计脚本只进线上产物」。
+  构建时间默认取站点内容里最新的文件修改时间（同样输入 → 同样产出，可复现），
+  用 --build-time 2006-01-02T15:04:05Z07:00 可显式固定。
 
 URL 规则（等效 nginx 的 try_files $uri $uri.html $uri/index.html，零重定向）：
   about.html       -> /about.html 命中真实文件

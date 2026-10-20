@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -86,6 +88,20 @@ func TestE2E(t *testing.T) {
 		about := readFile(t, filepath.Join(out, "about.html"))
 		if !strings.Contains(about, "E2E-SITE") || !strings.Contains(about, "ABOUT") {
 			t.Fatalf("产物未渲染模板或数据: %s", about)
+		}
+
+		// gen 默认是 prod 模式；asset 要带上真实内容哈希；default 兜底可用。
+		index := readFile(t, filepath.Join(out, "index.html"))
+		if !strings.Contains(index, ">PROD<") {
+			t.Fatalf("gen 产物应处于 prod 模式: %s", index)
+		}
+		cssSum := sha256.Sum256([]byte(".a{color:red}"))
+		wantAsset := `/static/css/site.css?v=` + hex.EncodeToString(cssSum[:])[:assetHashLength]
+		if !strings.Contains(index, wantAsset) {
+			t.Fatalf("产物里的资源链接应为 %s，实际: %s", wantAsset, index)
+		}
+		if !strings.Contains(index, ">E2E-SITE<") {
+			t.Fatalf("局部模板里的 default 兜底未生效: %s", index)
 		}
 		// 热重载脚本只注入 serve 的响应，产物必须干净。
 		for _, name := range []string{"index.html", "about.html", "help/index.html"} {
@@ -262,6 +278,20 @@ func TestE2E(t *testing.T) {
 			}
 		})
 
+		t.Run("serve 默认是 dev 模式且 asset 同样生效", func(t *testing.T) {
+			status, body := e2eGet(t, client, server.url+"/index.html")
+			if status != 200 {
+				t.Fatalf("状态码 = %d，期望 200", status)
+			}
+			if !strings.Contains(body, ">DEV<") {
+				t.Fatalf("serve 默认应为 dev 模式: %s", body)
+			}
+			cssSum := sha256.Sum256([]byte(".a{color:red}"))
+			if want := "/static/css/site.css?v=" + hex.EncodeToString(cssSum[:])[:assetHashLength]; !strings.Contains(body, want) {
+				t.Fatalf("serve 下的资源链接应带哈希 %s: %s", want, body)
+			}
+		})
+
 		t.Run("改动文件后通过 SSE 推送刷新事件", func(t *testing.T) {
 			// SSE 是长连接，这里不能用带 Timeout 的客户端。
 			streamClient := &http.Client{}
@@ -324,7 +354,8 @@ func TestE2E(t *testing.T) {
 
 	t.Run("关闭热重载后页面与产物一致", func(t *testing.T) {
 		// 用独立站点，避免受前面子测试改坏模板的影响。
-		server := startServe(t, binary, writeE2ESite(t), "--livereload=false")
+		// 同时验证 --mode prod：serve 也能预览生产模式的产物。
+		server := startServe(t, binary, writeE2ESite(t), "--livereload=false", "--mode", "prod")
 		client := &http.Client{Timeout: e2eHTTPTimeout}
 
 		status, body := e2eGet(t, client, server.url+"/about")
@@ -336,6 +367,24 @@ func TestE2E(t *testing.T) {
 		}
 		if status, _ := e2eGet(t, client, server.url+liveReloadPath); status != http.StatusNotFound {
 			t.Fatalf("关闭热重载后 SSE 端点应 404，实际 %d", status)
+		}
+
+		status, index := e2eGet(t, client, server.url+"/index.html")
+		if status != 200 || !strings.Contains(index, ">PROD<") {
+			t.Fatalf("--mode prod 下服务端应渲染 prod 分支: status=%d body=%s", status, index)
+		}
+	})
+
+	t.Run("--build-time 可固定构建时间", func(t *testing.T) {
+		// 用独立站点：共享站点在服务端子测试里被改坏过模板。
+		out := filepath.Join(t.TempDir(), "dist")
+		code, _, stderr := runBinary(t, binary, "gen", "--dir", writeE2ESite(t), "--out", out,
+			"--build-time", "2026-03-05T10:30:00Z")
+		if code != 0 {
+			t.Fatalf("gen 退出码 = %d，期望 0（stderr: %s）", code, stderr)
+		}
+		if index := readFile(t, filepath.Join(out, "index.html")); !strings.Contains(index, "2026-03-05") {
+			t.Fatalf("产物未使用固定的构建时间: %s", index)
 		}
 	})
 }
@@ -474,11 +523,15 @@ func writeE2ESite(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	files := map[string]string{
-		"index.html":                  `<html><body>{{template "header" .}}<h1>INDEX</h1></body></html>`,
+		// index 覆盖新模板函数：模式分支、asset 缓存失效、构建时间、default 兜底。
+		"index.html": `<html><body>{{template "header" .}}<h1>INDEX</h1>` +
+			`<p id="mode">{{if prod}}PROD{{else}}DEV{{end}}</p>` +
+			`<link rel="stylesheet" href="{{asset "/static/css/site.css"}}">` +
+			`<p id="build">{{buildTime | date "2006-01-02"}}</p></body></html>`,
 		"about.html":                  `<html><body>{{template "header" .}}<h1>ABOUT</h1></body></html>`,
 		"help/index.html":             `<html><body><h1>HELP-INDEX</h1></body></html>`,
 		"help/74.html":                `<html><body><h1>HELP-74</h1></body></html>`,
-		"templates/header.html":       `{{define "header"}}<header>{{.site.title}}</header>{{end}}`,
+		"templates/header.html":       `{{define "header"}}<header>{{.site.title | default "无标题"}}</header>{{end}}`,
 		"templates/data.json":         `{"site":{"title":"E2E-SITE"}}`,
 		"templates/note.txt":          "局部模板目录里的非 html 文件",
 		"static/css/site.css":         ".a{color:red}",

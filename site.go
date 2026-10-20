@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -26,6 +27,17 @@ const (
 	dataFileName = "data.json"
 )
 
+// Mode 是站点渲染模式，模板里用 dev / prod 判断。
+// serve 默认 dev、gen 默认 prod，可用 --mode 显式覆盖。
+type Mode string
+
+const (
+	// ModeDev 是开发模式：本地预览、可以包含调试标记。
+	ModeDev Mode = "dev"
+	// ModeProd 是生产模式：产物会发布出去的形态。
+	ModeProd Mode = "prod"
+)
+
 // SiteOptions 描述站点目录约定，serve 与 gen 共用。
 type SiteOptions struct {
 	// Dir 是页面目录，其中递归出现的 *.html 都视为页面。
@@ -35,6 +47,11 @@ type SiteOptions struct {
 	TemplateDir string
 	// ExcludeDirs 是不参与扫描的目录（相对 Dir），例如 gen 的产物目录。
 	ExcludeDirs []string
+	// Mode 是渲染模式；置空按 ModeDev 处理。
+	Mode Mode
+	// BuildTime 是模板里的构建时间；为零值时取站点内容里最新的文件修改时间，
+	// 保证「同样的输入产出同样的结果」。
+	BuildTime time.Time
 }
 
 // Site 是站点的渲染入口，持有页面清单与共享模板命名空间。
@@ -48,18 +65,24 @@ type Site struct {
 	excludes []string
 	// templatePrefix 是归一化后的局部模板目录（相对 root，斜杠分隔）。
 	templatePrefix string
+	// mode 是渲染模式（dev / prod）。
+	mode Mode
+	// buildTimeOverride 非零时作为模板里的构建时间。
+	buildTimeOverride time.Time
 
-	mu    sync.RWMutex
-	tmpl  *template.Template
-	pages map[string]string // 页面模板名 -> 源文件绝对路径
-	data  map[string]any    // 模板数据，来自模板目录下的 data.json
+	mu        sync.RWMutex
+	tmpl      *template.Template
+	pages     map[string]string // 页面模板名 -> 源文件绝对路径
+	data      map[string]any    // 模板数据，来自模板目录下的 data.json
+	buildTime time.Time         // 本次加载使用的构建时间
 }
 
 // siteSnapshot 是一次加载的完整结果，保证模板、页面清单与数据同时生效。
 type siteSnapshot struct {
-	tmpl  *template.Template
-	pages map[string]string
-	data  map[string]any
+	tmpl      *template.Template
+	pages     map[string]string
+	data      map[string]any
+	buildTime time.Time
 }
 
 // LoadSite 扫描页面目录并编译全部模板。
@@ -68,10 +91,16 @@ func LoadSite(opts SiteOptions) (*Site, error) {
 	if err != nil {
 		return nil, fmt.Errorf("解析页面目录 %q: %w", opts.Dir, err)
 	}
+	mode := opts.Mode
+	if mode == "" {
+		mode = ModeDev
+	}
 	site := &Site{
-		root:           root,
-		excludes:       absoluteDirs(root, opts.ExcludeDirs),
-		templatePrefix: cleanRelativeDir(opts.TemplateDir),
+		root:              root,
+		excludes:          absoluteDirs(root, opts.ExcludeDirs),
+		templatePrefix:    cleanRelativeDir(opts.TemplateDir),
+		mode:              mode,
+		buildTimeOverride: opts.BuildTime,
 	}
 	if err := site.Reload(); err != nil {
 		return nil, err
@@ -88,13 +117,52 @@ func (s *Site) Reload() error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tmpl, s.pages, s.data = snapshot.tmpl, snapshot.pages, snapshot.data
+	s.tmpl, s.pages, s.data, s.buildTime = snapshot.tmpl, snapshot.pages, snapshot.data, snapshot.buildTime
 	return nil
 }
 
 // Root 返回页面目录的绝对路径。
 func (s *Site) Root() string {
 	return s.root
+}
+
+// Mode 返回渲染模式（dev / prod）。
+func (s *Site) Mode() Mode {
+	return s.mode
+}
+
+// BuildTime 返回本次加载使用的构建时间。
+func (s *Site) BuildTime() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.buildTime
+}
+
+// assetFile 校验并返回可用于 asset 的静态资源文件。
+// 页面（渲染产物与源文件内容不一致，哈希源文件没有意义）、局部模板目录、
+// 产物目录与扫描忽略项一律拒绝，避免产出指向不存在资源的链接。
+func (s *Site) assetFile(urlPath string) (string, error) {
+	rel := strings.TrimPrefix(filepath.ToSlash(urlPath), "/")
+	if rel == "" {
+		return "", errors.New("asset 需要资源路径，例如 {{asset \"/static/css/site.css\"}}")
+	}
+	full := filepath.Join(s.root, filepath.FromSlash(rel))
+	back, err := filepath.Rel(s.root, full)
+	if err != nil || back == ".." || strings.HasPrefix(back, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("asset 路径越出站点目录：%s", urlPath)
+	}
+	if s.Ignored(full) || s.WithinTemplateDir(full) {
+		return "", fmt.Errorf("asset 只接受会进入产物的静态资源：%s", urlPath)
+	}
+	ext := filepath.Ext(rel)
+	if strings.EqualFold(ext, pageExt) && s.hasPage(strings.TrimSuffix(rel, ext)) {
+		return "", fmt.Errorf("asset 不接受页面（页面是渲染产物，请直接写路径）：%s", urlPath)
+	}
+	info, err := os.Stat(full)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", fmt.Errorf("asset 找不到静态资源：%s", urlPath)
+	}
+	return full, nil
 }
 
 // Pages 返回排序后的页面模板名，例如 index、about、help/74。
@@ -186,12 +254,19 @@ func (s *Site) WatchPaths() ([]string, error) {
 	return paths, nil
 }
 
-// compile 构造一次完整快照：模板命名空间、页面清单与 data.json 数据，
+// compile 构造一次完整快照：模板命名空间、页面清单、data.json 数据与构建时间，
 // 任一步失败即整体失败。
 func (s *Site) compile() (siteSnapshot, error) {
 	var snapshot siteSnapshot
 	snapshot.tmpl = template.New(s.root)
 	snapshot.pages = make(map[string]string)
+
+	// 模板函数绑定在本次加载的上下文上：模式、构建时间与资源哈希都随快照一起生效。
+	ctx := &renderContext{site: s, mode: s.mode}
+	funcs := templateFuncs(ctx)
+
+	// 站点内容里最新的文件修改时间，作为「构建时间」的默认值。
+	var newest time.Time
 
 	err := filepath.WalkDir(s.root, func(filePath string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -206,6 +281,9 @@ func (s *Site) compile() (siteSnapshot, error) {
 		if entry.IsDir() {
 			return nil
 		}
+		if info, err := entry.Info(); err == nil && info.ModTime().After(newest) {
+			newest = info.ModTime()
+		}
 		ext := filepath.Ext(filePath)
 		if !strings.EqualFold(ext, pageExt) {
 			return nil
@@ -219,7 +297,7 @@ func (s *Site) compile() (siteSnapshot, error) {
 		if err != nil {
 			return fmt.Errorf("读取模板 %s: %w", rel, err)
 		}
-		if _, err := snapshot.tmpl.New(name).Funcs(templateFuncs()).Parse(string(body)); err != nil {
+		if _, err := snapshot.tmpl.New(name).Funcs(funcs).Parse(string(body)); err != nil {
 			return fmt.Errorf("解析模板 %s: %w", rel, err)
 		}
 		if !s.isTemplateFile(rel) {
@@ -236,6 +314,23 @@ func (s *Site) compile() (siteSnapshot, error) {
 		return snapshot, err
 	}
 	snapshot.data = data
+
+	// 数据文件的修改时间也要算进去，否则只改 data.json 时构建时间不会变。
+	if s.buildTimeOverride.IsZero() {
+		if dataPath := s.DataFile(); dataPath != "" {
+			if info, err := os.Stat(dataPath); err == nil && info.ModTime().After(newest) {
+				newest = info.ModTime()
+			}
+		}
+		if newest.IsZero() {
+			// 空站点没有可推导的时间，退回到当前时间（这种站点本来也没有内容可复现）。
+			newest = time.Now()
+		}
+		ctx.buildTime = newest.Truncate(time.Second)
+	} else {
+		ctx.buildTime = s.buildTimeOverride
+	}
+	snapshot.buildTime = ctx.buildTime
 	return snapshot, nil
 }
 
