@@ -1,0 +1,16 @@
+# 统一行尾：所有文本文件在检出时都用 LF。
+#
+# 必要性：Git for Windows 默认 core.autocrlf=true，会把 .go 文件检出成 CRLF，
+# 于是 CI 里的 gofmt -l 会认为每个文件都未格式化（Windows 矩阵曾因此失败）。
+# 该文件必须提交进仓库，CI 检出时才会生效。
+* text=auto eol=lf
+
+# 明确按二进制处理，避免任何行尾转换。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.gz binary
+*.zip binary
+*.exe binary
