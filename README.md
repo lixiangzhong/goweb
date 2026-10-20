@@ -334,8 +334,11 @@ goweb completion zsh > "${fpath[1]}/_goweb"
 ```bash
 go build ./...
 go vet ./...
-go test ./...          # 含真实 fsnotify 文件监听用例
-go test -race ./...
+go test -short ./...          # 单元测试（跳过 e2e，秒级）
+go test ./...                 # 单元 + 端到端
+go test -race -count=1 ./...  # 完整（CI 同款）
+go test -run TestE2E -v ./... # 只看端到端
+go test -short -cover ./...   # 覆盖率
 ```
 
 源码结构（`package main`，扁平分层，不做过度抽象）：
@@ -348,7 +351,23 @@ go test -race ./...
 | `gen.go` | 静态产物落盘、资源拷贝、清空护栏 |
 | `funcs.go` | 内置模板函数 `HTML`、`JS` |
 
-CI 在 Ubuntu 与 macOS 上运行 `gofmt` 检查、`go mod tidy` 校验、`go vet` 与 `go test -race`。
+### 测试分层
+
+测试只打公开边界，不针对内部实现；每一层都有明确的观察面：
+
+| 测试 | 边界 | 覆盖内容 |
+| --- | --- | --- |
+| `site_test.go` | `LoadSite` / `Reload` / `Render` / `Resolve` / `WatchPaths` | 页面发现与忽略规则、try_files 三候选顺序与路径归一化、data.json 语义、坏模板保留上一版、并发渲染与重载 |
+| `gen_test.go` | `Generate` | 产物树、资源拷贝（嵌套目录/符号链接/忽略项）、清空护栏、快速失败、错误路径 |
+| `serve_test.go` | `newHandler` / `watchSite` | 状态码与响应头、访问日志、渲染失败回 500、fsnotify 重载与失败韧性、新增文件被发现 |
+| `main_test.go` | cobra 命令树 | 参数默认值与短选项、公共参数前置、错误前缀与 usage、`--version` 注入 |
+| `e2e_test.go` | **真实二进制 + 真实 HTTP** | 编译 goweb → 跑 `gen`（产物清单、幂等、护栏退出码、坏数据失败）与 `serve`（全部 URL 语义、405/404、缓存头、热重载、坏模板韧性、`--version`/`help`/`completion`） |
+
+端到端测试用 `--addr 127.0.0.1:0` 让内核分配端口，再从启动日志里读回真实地址，因此不会与并行任务抢端口；`go test -short` 会跳过它（需要编译与监听）。
+
+测试质量本身经过故障注入验证：分别破坏模板目录隔离、尾斜杠语义、产物目录护栏与解析错误处理，对应测试都会立刻变红。
+
+CI 在 Ubuntu 与 macOS 上运行 `gofmt` 检查、`go mod tidy` 校验、`go vet`、单元测试（`-race` + 覆盖率）与端到端测试。
 
 ## 贡献
 
