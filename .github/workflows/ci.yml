@@ -44,5 +44,11 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        run: go test -race ./...
+      - name: Unit tests
+        run: go test -short -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+      - name: E2E tests (real binary + HTTP + hot reload)
+        run: go test -race -count=1 -run TestE2E ./...
