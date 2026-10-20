@@ -42,6 +42,7 @@ func main() {
 func newRootCommand() *cobra.Command {
 	globals := &globalOptions{}
 	var addr string
+	var liveReload bool
 
 	root := &cobra.Command{
 		Use:     "goweb",
@@ -53,13 +54,14 @@ func newRootCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// 参数已解析完成，运行期错误不再刷 usage。
 			cmd.SilenceUsage = true
-			return runServe(cmd, serveOptions{addr: addr, globals: globals})
+			return runServe(cmd, serveOptions{addr: addr, liveReload: liveReload, globals: globals})
 		},
 	}
 	// 统一错误前缀（形如 goweb: ...），并与 usage 的输出顺序保持一致。
 	root.SetErrPrefix("goweb:")
 	addGlobalFlags(root, globals)
 	root.Flags().StringVarP(&addr, "addr", "a", defaultAddr, "监听地址（根命令等价于 serve）")
+	addLiveReloadFlag(root, &liveReload)
 
 	root.AddCommand(newServeCommand(globals), newGenCommand(globals))
 	return root
@@ -68,19 +70,21 @@ func newRootCommand() *cobra.Command {
 // newServeCommand 构造 serve 子命令：行为与不带子命令的根命令一致。
 func newServeCommand(globals *globalOptions) *cobra.Command {
 	var addr string
+	var liveReload bool
 
 	cmd := &cobra.Command{
 		Use:     "serve",
 		Short:   "启动开发服务器",
-		Long:    "启动开发服务器：目录式路由 + 模板渲染 + 静态文件直出；模板或 data.json 变更后自动重载，浏览器手动刷新即可。",
+		Long:    "启动开发服务器：目录式路由 + 模板渲染 + 静态文件直出；站点文件变更后自动重载，并通过 SSE 让浏览器自动刷新。",
 		Example: serveExample,
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cmd.SilenceUsage = true
-			return runServe(cmd, serveOptions{addr: addr, globals: globals})
+			return runServe(cmd, serveOptions{addr: addr, liveReload: liveReload, globals: globals})
 		},
 	}
 	cmd.Flags().StringVarP(&addr, "addr", "a", defaultAddr, "监听地址")
+	addLiveReloadFlag(cmd, &liveReload)
 	return cmd
 }
 
@@ -105,6 +109,12 @@ func newGenCommand(globals *globalOptions) *cobra.Command {
 	return cmd
 }
 
+// addLiveReloadFlag 挂载浏览器热重载开关；根命令与 serve 子命令共用同一套语义。
+func addLiveReloadFlag(cmd *cobra.Command, liveReload *bool) {
+	cmd.Flags().BoolVarP(liveReload, "livereload", "l", true,
+		"注入热重载脚本并通过 SSE 让浏览器自动刷新（关闭后页面与线上产物完全一致）")
+}
+
 // addGlobalFlags 挂载根命令与子命令共用的参数。
 // 用 persistent flag 是为了让 `goweb --dir site gen` 这类写法同样生效，
 // 而不是被父命令静默吞掉。
@@ -117,8 +127,9 @@ func addGlobalFlags(cmd *cobra.Command, globals *globalOptions) {
 
 // serveOptions 是 serve 的参数。
 type serveOptions struct {
-	globals *globalOptions
-	addr    string
+	globals    *globalOptions
+	addr       string
+	liveReload bool
 }
 
 // genOptions 是 gen 的参数。
@@ -140,7 +151,17 @@ func runServe(cmd *cobra.Command, opts serveOptions) error {
 		return err
 	}
 
-	stopWatch, err := watchSite(site, logger)
+	// 热重载：站点重载成功后广播给所有已连接的浏览器页面。
+	var live *liveReloadHub
+	if opts.liveReload {
+		live = newLiveReloadHub()
+	}
+
+	stopWatch, err := watchSite(site, logger, func() {
+		if live != nil {
+			live.broadcast()
+		}
+	})
 	if err != nil {
 		return err
 	}
@@ -155,7 +176,7 @@ func runServe(cmd *cobra.Command, opts serveOptions) error {
 	defer listener.Close()
 
 	server := &http.Server{
-		Handler:           newHandler(site, logger),
+		Handler:           newHandler(site, logger, live),
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
 	logger.Info("goweb 开发服务器已启动",
@@ -163,6 +184,7 @@ func runServe(cmd *cobra.Command, opts serveOptions) error {
 		"dir", site.Root(),
 		"pages", len(site.Pages()),
 		"data", site.DataFile(),
+		"livereload", opts.liveReload,
 	)
 	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -205,10 +227,15 @@ func newLogger(w io.Writer) *slog.Logger {
 
 const rootLongDescription = `goweb 用两个子命令覆盖「本地写页面 → 产出静态站」的完整流程：
 
-  serve   起开发服务器，页面 URL 与静态托管严格一致，改完自动重载
+  serve   起开发服务器，页面 URL 与静态托管严格一致，改完自动重载并让浏览器自动刷新
   gen     渲染模板产出纯静态站，可直接部署
 
 不带子命令时等价于 serve，直接在当前目录起开发服务器。
+
+浏览器热重载（--livereload，默认开启）：
+  serve 会在 html 响应末尾注入一段脚本，通过 SSE 端点 ` + liveReloadPath + ` 接收刷新信号；
+  改页面、模板、data.json 或静态资源都会整页刷新。这是 serve 独有的注入，
+  gen 产物不含任何脚本；用 --livereload=false 可关闭，让页面与线上产物完全一致。
 
 目录约定：
   页面目录（--dir，默认 .）中递归出现的 *.html 都是页面：
@@ -227,11 +254,13 @@ URL 规则（等效 nginx 的 try_files $uri $uri.html $uri/index.html，零重�
 
 const rootExample = `  goweb                        # 等价于 goweb serve，访问 http://localhost:8080/
   goweb --addr :3000           # 换端口
+  goweb --livereload=false     # 关掉浏览器自动刷新
   goweb --dir site gen         # 公共参数写在哪一层都生效
   goweb gen --out public       # 产出到 public/`
 
 const serveExample = `  goweb serve
   goweb serve --addr :3000
+  goweb serve --livereload=false
   goweb serve --dir site --template templates`
 
 const genExample = `  goweb gen

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -85,6 +86,12 @@ func TestE2E(t *testing.T) {
 		about := readFile(t, filepath.Join(out, "about.html"))
 		if !strings.Contains(about, "E2E-SITE") || !strings.Contains(about, "ABOUT") {
 			t.Fatalf("产物未渲染模板或数据: %s", about)
+		}
+		// 热重载脚本只注入 serve 的响应，产物必须干净。
+		for _, name := range []string{"index.html", "about.html", "help/index.html"} {
+			if body := readFile(t, filepath.Join(out, filepath.FromSlash(name))); strings.Contains(body, liveReloadMarker) {
+				t.Fatalf("产物 %s 不应包含热重载脚本: %s", name, body)
+			}
 		}
 	})
 
@@ -248,19 +255,88 @@ func TestE2E(t *testing.T) {
 			waitForBody(t, client, server.url+"/index.html", "E2E-EDITED")
 		})
 
+		t.Run("页面注入了热重载脚本", func(t *testing.T) {
+			status, body := e2eGet(t, client, server.url+"/about")
+			if status != 200 || !strings.Contains(body, liveReloadMarker) {
+				t.Fatalf("页面未注入热重载脚本: status=%d body=%s", status, body)
+			}
+		})
+
+		t.Run("改动文件后通过 SSE 推送刷新事件", func(t *testing.T) {
+			// SSE 是长连接，这里不能用带 Timeout 的客户端。
+			streamClient := &http.Client{}
+			ctx, cancel := context.WithTimeout(context.Background(), e2eReloadTimeout+5*time.Second)
+			defer cancel()
+
+			request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.url+liveReloadPath, nil)
+			if err != nil {
+				t.Fatalf("构造 SSE 请求: %v", err)
+			}
+			response, err := streamClient.Do(request)
+			if err != nil {
+				t.Fatalf("连接 SSE: %v", err)
+			}
+			defer response.Body.Close()
+
+			if got := response.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+				t.Fatalf("Content-Type = %q，期望 text/event-stream", got)
+			}
+
+			reader := bufio.NewReader(response.Body)
+			if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, "retry:") {
+				t.Fatalf("SSE 首包异常: %q err=%v", line, err)
+			}
+
+			// 订阅已建立，改文件触发重载。
+			writeFile(t, filepath.Join(siteDir, "about.html"), "<html><body><h1>ABOUT-SSE</h1></body></html>")
+
+			for {
+				line, err := reader.ReadString('\n')
+				if strings.TrimSpace(line) == "data: reload" {
+					return
+				}
+				if err != nil {
+					t.Fatalf("未收到 reload 事件: %v", err)
+				}
+			}
+		})
+
 		t.Run("坏模板不拖垮服务", func(t *testing.T) {
+			// 记录当前页面内容，坏模板后应当仍然返回同一份内容（与前面的子测试无关）。
+			status, expected := e2eGet(t, client, server.url+"/about")
+			if status != 200 {
+				t.Fatalf("改坏模板前 GET /about 状态码 = %d，期望 200", status)
+			}
+
 			writeFile(t, filepath.Join(siteDir, "about.html"), "<html>{{template ")
 			// 等防抖窗口 + 一次失败的重载
 			time.Sleep(500 * time.Millisecond)
 
 			status, body := e2eGet(t, client, server.url+"/about")
-			if status != 200 || !strings.Contains(body, "ABOUT-EDITED") {
-				t.Fatalf("坏模板下应继续提供上一份可用页面，实际 status=%d body=%s", status, body)
+			if status != 200 || body != expected {
+				t.Fatalf("坏模板下应继续提供上一份可用页面，实际 status=%d body=%s（期望 %s）", status, body, expected)
 			}
 			if log := server.logs(); !strings.Contains(log, "站点重载失败") {
 				t.Fatalf("日志中缺少重载失败记录: %s", log)
 			}
 		})
+	})
+
+	t.Run("关闭热重载后页面与产物一致", func(t *testing.T) {
+		// 用独立站点，避免受前面子测试改坏模板的影响。
+		server := startServe(t, binary, writeE2ESite(t), "--livereload=false")
+		client := &http.Client{Timeout: e2eHTTPTimeout}
+
+		status, body := e2eGet(t, client, server.url+"/about")
+		if status != 200 {
+			t.Fatalf("GET /about 状态码 = %d，期望 200（body: %s）", status, body)
+		}
+		if strings.Contains(body, liveReloadMarker) {
+			t.Fatalf("关闭热重载后不应注入脚本: %s", body)
+		}
+		if status, _ := e2eGet(t, client, server.url+liveReloadPath); status != http.StatusNotFound {
+			t.Fatalf("关闭热重载后 SSE 端点应 404，实际 %d", status)
+		}
 	})
 }
 
@@ -280,12 +356,13 @@ func (s *e2eServer) logs() string {
 	return s.stderr.String()
 }
 
-// startServe 编译后的二进制起一个开发服务器，等待它打印真实监听地址后返回。
+// startServe 用编译后的二进制起一个开发服务器，等待它打印真实监听地址后返回。
 // 用 --addr 127.0.0.1:0 让内核分配端口，再从日志里取回，避免端口冲突。
-func startServe(t *testing.T, binary, siteDir string) *e2eServer {
+func startServe(t *testing.T, binary, siteDir string, extraArgs ...string) *e2eServer {
 	t.Helper()
 
-	cmd := exec.Command(binary, "serve", "--dir", siteDir, "--addr", "127.0.0.1:0")
+	args := append([]string{"serve", "--dir", siteDir, "--addr", "127.0.0.1:0"}, extraArgs...)
+	cmd := exec.Command(binary, args...)
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		t.Fatalf("获取 stderr: %v", err)

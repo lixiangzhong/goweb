@@ -33,7 +33,7 @@ func (b *syncBuffer) String() string {
 // newHandlerWithLog 构造处理器，并把日志收进返回的缓冲，便于断言。
 func newHandlerWithLog(site *Site) (http.Handler, *syncBuffer) {
 	logs := new(syncBuffer)
-	return newHandler(site, slog.New(slog.NewTextHandler(logs, nil))), logs
+	return newHandler(site, slog.New(slog.NewTextHandler(logs, nil)), nil), logs
 }
 
 // writeFile 写入文件并创建父目录。

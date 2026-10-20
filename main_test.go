@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 // executeCLI 用给定参数跑一次完整的 CLI（每次都新建命令树，避免状态串味），
@@ -245,6 +247,26 @@ func TestCommandFlagDefaults(t *testing.T) {
 	if got, err := genCmd.Flags().GetBool("clean"); err != nil || !got {
 		t.Fatalf("gen --clean 默认值 = %v（err=%v），期望 true", got, err)
 	}
+	if genCmd.Flags().Lookup("livereload") != nil {
+		t.Fatal("gen 子命令不应接受 --livereload")
+	}
+
+	// 根命令与 serve 子命令都带热重载开关，且默认开启。
+	for name, cmd := range map[string]*cobra.Command{"根命令": root, "serve": serveCmd(t, root)} {
+		if got, err := cmd.Flags().GetBool("livereload"); err != nil || !got {
+			t.Fatalf("%s --livereload 默认值 = %v（err=%v），期望 true", name, got, err)
+		}
+	}
+}
+
+// serveCmd 取出 serve 子命令。
+func serveCmd(t *testing.T, root *cobra.Command) *cobra.Command {
+	t.Helper()
+	cmd, _, err := root.Find([]string{"serve"})
+	if err != nil {
+		t.Fatalf("查找 serve: %v", err)
+	}
+	return cmd
 }
 
 // TestVersionFlagUsesInjectedVersion 覆盖构建时用 -ldflags 注入版本号后的 --version 输出。

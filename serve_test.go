@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -11,9 +13,15 @@ import (
 	"time"
 )
 
-// newTestHandler 构造测试用处理器，日志丢弃。
+// newTestHandler 构造测试用处理器：日志丢弃、不开浏览器热重载。
 func newTestHandler(site *Site) http.Handler {
-	return newHandler(site, slog.New(slog.DiscardHandler))
+	return newHandler(site, slog.New(slog.DiscardHandler), nil)
+}
+
+// newTestHandlerWithLive 构造开启了浏览器热重载的处理器，返回处理器与订阅中心。
+func newTestHandlerWithLive(site *Site) (http.Handler, *liveReloadHub) {
+	hub := newLiveReloadHub()
+	return newHandler(site, slog.New(slog.DiscardHandler), hub), hub
 }
 
 func TestHandlerRoutes(t *testing.T) {
@@ -90,7 +98,7 @@ func TestWatchReloadsTemplates(t *testing.T) {
 		t.Fatalf("LoadSite: %v", err)
 	}
 
-	stop, err := watchSite(site, slog.New(slog.DiscardHandler))
+	stop, err := watchSite(site, slog.New(slog.DiscardHandler), nil)
 	if err != nil {
 		t.Fatalf("watchSite: %v", err)
 	}
@@ -191,7 +199,7 @@ func TestWatchKeepsServingAfterBrokenTemplate(t *testing.T) {
 	}
 
 	logs := new(syncBuffer)
-	stop, err := watchSite(site, slog.New(slog.NewTextHandler(logs, nil)))
+	stop, err := watchSite(site, slog.New(slog.NewTextHandler(logs, nil)), nil)
 	if err != nil {
 		t.Fatalf("watchSite: %v", err)
 	}
@@ -219,7 +227,7 @@ func TestWatchNoticesNewFiles(t *testing.T) {
 		t.Fatalf("LoadSite: %v", err)
 	}
 
-	stop, err := watchSite(site, slog.New(slog.DiscardHandler))
+	stop, err := watchSite(site, slog.New(slog.DiscardHandler), nil)
 	if err != nil {
 		t.Fatalf("watchSite: %v", err)
 	}
@@ -236,5 +244,136 @@ func TestWatchNoticesNewFiles(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "NEW-PAGE") {
 		t.Fatalf("新页面内容不正确: %s", body)
+	}
+}
+
+// TestHandlerInjectsLiveReload 覆盖热重载脚本的注入范围与开关。
+func TestHandlerInjectsLiveReload(t *testing.T) {
+	site := loadTestSite(t, map[string]string{
+		"about.html":   "<html><body><h1>ABOUT</h1></body></html>",
+		"static/a.css": "body{}",
+	})
+
+	t.Run("开启时注入到 body 之前", func(t *testing.T) {
+		handler, _ := newTestHandlerWithLive(site)
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/about", nil))
+
+		body := recorder.Body.String()
+		if !strings.Contains(body, liveReloadMarker) || !strings.Contains(body, liveReloadPath) {
+			t.Fatalf("页面未注入热重载脚本: %s", body)
+		}
+		if strings.Index(body, liveReloadMarker) > strings.Index(strings.ToLower(body), "</body>") {
+			t.Fatalf("脚本应插在 </body> 之前: %s", body)
+		}
+	})
+
+	t.Run("关闭时保持原样", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		newTestHandler(site).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/about", nil))
+
+		if body := recorder.Body.String(); strings.Contains(body, liveReloadMarker) {
+			t.Fatalf("关闭热重载后不应注入脚本: %s", body)
+		}
+	})
+
+	t.Run("关闭时端点不存在", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		newTestHandler(site).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, liveReloadPath, nil))
+
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("关闭热重载后端点应 404，实际 %d", recorder.Code)
+		}
+	})
+
+	t.Run("静态文件不注入", func(t *testing.T) {
+		handler, _ := newTestHandlerWithLive(site)
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/static/a.css", nil))
+
+		if body := recorder.Body.String(); strings.Contains(body, liveReloadMarker) {
+			t.Fatalf("静态文件不应被注入: %s", body)
+		}
+	})
+}
+
+// TestLiveReloadEndpointStreams 用真实 HTTP 连接验证 SSE：建立连接后广播能收到 reload 事件。
+func TestLiveReloadEndpointStreams(t *testing.T) {
+	site := loadTestSite(t, map[string]string{"index.html": "<html><body>INDEX</body></html>"})
+	handler, hub := newTestHandlerWithLive(site)
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+liveReloadPath, nil)
+	if err != nil {
+		t.Fatalf("构造请求: %v", err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("连接 SSE: %v", err)
+	}
+	defer response.Body.Close()
+
+	if got := response.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		t.Fatalf("Content-Type = %q，期望 text/event-stream", got)
+	}
+	if got := response.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q，期望 no-store", got)
+	}
+
+	reader := bufio.NewReader(response.Body)
+	// 首包是重连提示，收到它说明流已建立、订阅已注册。
+	line, err := reader.ReadString('\n')
+	if err != nil || !strings.HasPrefix(line, "retry:") {
+		t.Fatalf("首个分片异常: %q err=%v", line, err)
+	}
+
+	hub.broadcast()
+
+	received := make([]string, 0, 4)
+	for {
+		line, err := reader.ReadString('\n')
+		if line != "" {
+			received = append(received, strings.TrimSpace(line))
+			if strings.TrimSpace(line) == "data: reload" {
+				return
+			}
+		}
+		if err != nil {
+			t.Fatalf("未收到 reload 事件就断流: %v（已收到 %v）", err, received)
+		}
+	}
+}
+
+// TestWatchBroadcastsOnlyOnSuccessfulReload 覆盖广播时机：成功重载才通知浏览器。
+func TestWatchBroadcastsOnlyOnSuccessfulReload(t *testing.T) {
+	dir := writeSite(t, map[string]string{"index.html": "<html><body>INDEX</body></html>"})
+	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates"})
+	if err != nil {
+		t.Fatalf("LoadSite: %v", err)
+	}
+
+	reloaded := make(chan struct{}, 8)
+	stop, err := watchSite(site, slog.New(slog.DiscardHandler), func() { reloaded <- struct{}{} })
+	if err != nil {
+		t.Fatalf("watchSite: %v", err)
+	}
+	defer stop()
+
+	writeFile(t, filepath.Join(dir, "index.html"), "<html><body>INDEX-EDITED</body></html>")
+	waitFor(t, 5*time.Second, func() bool { return len(reloaded) > 0 }, "成功重载后应通知浏览器")
+	for len(reloaded) > 0 {
+		<-reloaded
+	}
+
+	// 坏模板：重载失败，不应通知浏览器刷新（刷新只会看到同一份旧内容）。
+	writeFile(t, filepath.Join(dir, "index.html"), "<html>{{template ")
+	time.Sleep(600 * time.Millisecond)
+	if len(reloaded) != 0 {
+		t.Fatalf("重载失败不应通知浏览器，实际收到 %d 次", len(reloaded))
 	}
 }

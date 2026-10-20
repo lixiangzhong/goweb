@@ -17,15 +17,18 @@ const (
 	readHeaderTimeout = 10 * time.Second
 )
 
-// handler 是 serve 的 HTTP 入口：目录式路由 + 模板渲染 + 静态文件直出。
+// handler 是 serve 的 HTTP 入口：目录式路由 + 模板渲染 + 静态文件直出，
+// 开启热重载时还会注入刷新脚本并开放 SSE 端点。
 type handler struct {
 	site   *Site
 	logger *slog.Logger
+	// live 为 nil 表示未开启浏览器热重载。
+	live *liveReloadHub
 }
 
-// newHandler 构造 serve 的 HTTP 处理器。
-func newHandler(site *Site, logger *slog.Logger) http.Handler {
-	return &handler{site: site, logger: logger}
+// newHandler 构造 serve 的 HTTP 处理器；live 为 nil 时不注入脚本、SSE 端点也返回 404。
+func newHandler(site *Site, logger *slog.Logger, live *liveReloadHub) http.Handler {
+	return &handler{site: site, logger: logger, live: live}
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -53,6 +56,12 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 热重载端点优先于站点 URL 解析，站点里同名文件让位。
+	if h.live != nil && r.URL.Path == liveReloadPath {
+		h.serveLiveReload(w, r)
+		return
+	}
+
 	switch route := h.site.Resolve(r.URL.Path); route.Kind {
 	case RoutePage:
 		h.renderPage(w, route.Name)
@@ -70,6 +79,10 @@ func (h *handler) renderPage(w http.ResponseWriter, name string) {
 		h.logger.Error("渲染页面失败", "page", name, "err", err)
 		http.Error(w, "goweb 渲染失败: "+err.Error(), http.StatusInternalServerError)
 		return
+	}
+	// 热重载脚本只注入 serve 的页面响应，gen 产物保持干净。
+	if h.live != nil {
+		body = injectLiveReload(body, liveReloadSnippet)
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	// 开发服务器始终取最新内容，避免改完页面被浏览器旧副本挡住。
@@ -117,26 +130,37 @@ func (r *statusRecorder) Write(body []byte) (int, error) {
 	return r.ResponseWriter.Write(body)
 }
 
+// Flush 透传底层 writer 的刷写能力。
+// 少了它，包装后的响应就不再满足 http.Flusher，SSE 长连接会被误判为不支持流式响应。
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 // siteWatcher 监听站点文件变更并在防抖后重载模板与数据。
 type siteWatcher struct {
 	site    *Site
 	logger  *slog.Logger
 	watcher *fsnotify.Watcher
+	// onReload 在每次成功重载后调用，用于通知浏览器刷新；可为 nil。
+	onReload func()
 
 	mu    sync.Mutex
 	timer *time.Timer
 }
 
-// watchSite 启动站点文件监听，返回停止监听的函数。
-func watchSite(site *Site, logger *slog.Logger) (func(), error) {
+// watchSite 启动站点文件监听，返回停止监听的函数；onReload 可为 nil。
+func watchSite(site *Site, logger *slog.Logger, onReload func()) (func(), error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
 	sw := &siteWatcher{
-		site:    site,
-		logger:  logger,
-		watcher: watcher,
+		site:     site,
+		logger:   logger,
+		watcher:  watcher,
+		onReload: onReload,
 	}
 	if err := sw.addPaths(); err != nil {
 		watcher.Close()
@@ -180,11 +204,15 @@ func (w *siteWatcher) schedule() {
 
 // reload 重载模板与 data.json，并补挂新增目录的监听。
 // 重载失败说明模板或数据正改到一半，此时保留上一份可用内容并报错，不让开发服务器挂掉。
+// 只有重载成功才通知浏览器刷新：失败时刷新只会看到同一份旧内容，反而让人困惑。
 func (w *siteWatcher) reload() {
 	if err := w.site.Reload(); err != nil {
 		w.logger.Error("站点重载失败，继续使用上一份模板与数据", "err", err)
 	} else {
 		w.logger.Info("站点已重载", "pages", len(w.site.Pages()))
+		if w.onReload != nil {
+			w.onReload()
+		}
 	}
 	if err := w.addPaths(); err != nil {
 		w.logger.Warn("补挂文件监听失败", "err", err)
