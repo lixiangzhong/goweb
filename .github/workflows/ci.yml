@@ -49,6 +49,9 @@ jobs:
         run: go vet ./...
 
       - name: Unit tests
+        # 用 bash 而不是 Windows 默认的 pwsh：pwsh 下 -coverprofile=coverage.out
+        # 会被拆出一个多余的 .out 包参数（FAIL .out [setup failed]）。
+        shell: bash
         run: go test -short -count=1 -coverprofile=coverage.out ./...
 
       - name: Coverage summary
