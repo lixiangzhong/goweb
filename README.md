@@ -9,7 +9,7 @@
 
 `goweb` 是一个 Go 写的单二进制静态站工具，只有两个子命令：
 
-- **`goweb serve`** —— 在站点目录起开发服务器。页面 URL 与最终静态托管（nginx / GitHub Pages）**严格一致**，改完模板或数据自动重新加载。
+- **`goweb serve`** —— 在站点目录起开发服务器。产物与源码一一对应，开发服务器不做任何尾斜杠/扩展名重定向，改完模板或数据自动重新加载。
 - **`goweb gen`** —— 把页面渲染成纯静态站，产出 `dist/`，拷到任何静态托管即可上线。
 
 不需要 npm、webpack、vite，没有配置文件，只依赖标准库 + [cobra](https://github.com/spf13/cobra) + [fsnotify](https://github.com/fsnotify/fsnotify)。
@@ -35,11 +35,12 @@
 ## 特性
 
 - **零配置零构建**：站点就是一堆 `.html` + css/js，写完直接预览，不用装任何前端工具链。
-- **URL 与线上严格一致**：页面 URL 一律目录式（`/about/` ↔ `dist/about/index.html`），本地通过、线上 404 这类问题从根上避免。
+- **产物跟随源码路径**：`about.html` → `dist/about.html`，`help/74.html` → `dist/help/74.html`，产物与源码一一对应，部署后 `file://` 也能直接打开。
+- **开发服务器零重定向**：`/about`、`/about/`、`/about.html`、`/about/index.html` 都能直接打开，URL 原样保留（只有 `//about//` 这类非规范路径才 301 归一化）。
 - **复用页头页脚**：直接用 Go 的 `html/template`，`{{define}}` + `{{template}}` 抽公共片段，不需要学新语法。
 - **站点级数据**：`templates/data.json` 提供站名、备案号、导航等共享变量，页面与局部模板都能取。
 - **保存即可见**：模板、页面或数据文件变更后自动重新加载，浏览器刷新即可；改到一半的坏模板不会让服务挂掉。
-- **一条命令静态化**：`goweb gen` 原地产出 `dist/`，页面目录式落盘，其余文件原样拷贝。
+- **一条命令静态化**：`goweb gen` 原地产出 `dist/`，其余文件原样拷贝。
 - **危险操作有护栏**：清空产物目录前会拦截页面目录本身、其父目录、局部模板目录与用户主目录。
 - **快速失败**：任一页面渲染失败即整体失败、非零退出，绝不把半成品产物当成成功发布。
 
@@ -75,9 +76,9 @@ goweb gen            # 产出 dist/，直接部署
 
 ```
 mysite/
-├── index.html              -> /
-├── about.html              -> /about/
-├── help/74.html            -> /help/74/
+├── index.html              -> /          产物 dist/index.html
+├── about.html              -> /about.html 产物 dist/about.html
+├── help/74.html            -> /help/74.html
 ├── templates/              局部模板与数据，不产出页面、不可直接访问
 │   ├── header.html
 │   └── data.json
@@ -131,16 +132,18 @@ $ goweb gen
 time=2026-10-20T15:15:33+08:00 level=INFO msg=静态站已生成 out=/Users/me/mysite/dist pages=2 assets=1 data=/Users/me/mysite/templates/data.json
 
 $ find dist -type f
-dist/about/index.html
+dist/about.html
 dist/index.html
 dist/static/css/site.css
 ```
+
+产物路径严格跟随源码路径：源码里的 `about.html` 就产出 `dist/about.html`。
 
 ## 目录约定
 
 | 路径 | 作用 |
 | --- | --- |
-| 页面目录（`--dir`，默认当前目录） | 其中递归出现的 `*.html` 都是页面 |
+| 页面目录（`--dir`，默认当前目录） | 其中递归出现的 `*.html` 都是页面，产物同名同路径 |
 | `--template`（默认 `templates/`） | 局部模板目录：内部 html 只参与模板解析，不产出页面、也不能被直接访问；`data.json` 也放在这里 |
 | 其他任意文件/目录 | 视为静态资源，`gen` 时原样拷贝进产物、`serve` 时直接对外提供 |
 
@@ -149,6 +152,8 @@ dist/static/css/site.css
 - 以 `.` 开头的文件与目录（`.git`、`.DS_Store` 等）
 - `node_modules/`
 - 产物目录（`serve` 固定忽略 `dist/`，`gen` 忽略 `--out` 指定的目录）
+
+局部模板目录与产物目录内的文件都不会被 `serve` 对外提供（直接访问返回 404）。
 
 ## 模板
 
@@ -204,19 +209,23 @@ dist/static/css/site.css
 
 ## URL 规则
 
-`serve` 的路由与 `gen` 的产物布局严格一致，页面 URL 一定以 `/` 结尾：
+`serve` **不做尾斜杠与扩展名的重定向**：只要能对上页面，URL 原样保留直接返回 200。
 
-| 请求 | 结果 |
-| --- | --- |
-| `/` | 渲染 `index.html` |
-| `/about/` | 渲染 `about.html` |
-| `/about`、`/about.html` | `301` 到 `/about/` |
-| `/index.html` | `301` 到 `/` |
-| `/help/` | 先找 `help/index.html`，回退 `help.html` |
-| `/help/74/` | 渲染 `help/74.html` |
-| `/static/css/site.css` | 磁盘文件直出 |
-| `/templates/header.html`、`/templates/data.json` | `404`：局部模板目录整体不可访问 |
-| 其他 | 纯文本 `404`（无自定义 404 页面，不做目录列表） |
+| 请求 | 本地 serve | 产物里存在？ | GitHub Pages / Netlify / Cloudflare | 裸 nginx |
+| --- | --- | --- | --- | --- |
+| `/about.html` | 200 | 是（`dist/about.html`） | 200 | 200 |
+| `/about` | 200 | 否，属宽容写法 | 200 | 404（加一行 `try_files` 后 200） |
+| `/about/` | 200 | 否 | 404 | 404 |
+| `/about/index.html` | 200 | 否 | 404 | 404 |
+| `/help/`、`/help/index.html` | 200 | 是 | 200 | 200 |
+| `/help` | 200 | 否 | 301 → `/help/` | 301 → `/help/` |
+| `/static/css/site.css` | 200（磁盘文件直出） | 是 | 200 | 200 |
+| `//about//`、`/a/../about` | `301` 归一化 | — | — | — |
+| `/templates/*`、`/dist/*` | `404` | 局部模板目录与产物目录不对外提供 | 404 | 404 |
+| 其他 | 纯文本 `404`（无自定义 404 页面，不做目录列表） | — | — | — |
+
+**代价要说清楚**：同一个页面存在多个可用 URL，但线上**只有 `/about.html` 必然存在**。
+站内链接建议统一写 `/about.html`（或部署端加一行 `try_files`，让无扩展名写法在线上也可用，见[部署](#部署)）。
 
 非 GET/HEAD 请求返回 `405`；开发期响应带 `Cache-Control: no-store`，避免改完文件被浏览器旧副本挡住。
 
@@ -229,36 +238,43 @@ goweb gen --clean=false            # 不清空，只覆盖同名文件（-c=fals
 goweb gen --dir site --template templates
 ```
 
-产物布局与源码一一对应：
+产物路径与源码路径一一对应：
 
 ```
-dist/
-├── index.html
-├── about/index.html
-├── help/74/index.html
-├── static/...                 （原样拷贝）
-└── robots.txt                 （原样拷贝）
+源码                          产物
+index.html              →    dist/index.html
+about.html              →    dist/about.html
+help/index.html         →    dist/help/index.html
+help/74.html            →    dist/help/74.html
+static/css/site.css     →    dist/static/css/site.css
+robots.txt              →    dist/robots.txt
+templates/**            →    （不产出、不拷贝）
 ```
 
-- 页面按目录式落盘：`about.html` → `dist/about/index.html`（`index` 页落在所在目录的 `index.html`）。
+- 页面按源码路径落盘：`about.html` → `dist/about.html`，不再做 `<页面>/index.html` 的目录式转换。
 - 除页面、局部模板目录、忽略项之外的所有文件**原样拷贝**，相对路径不变。
 - 生成前清空产物目录（`--clean=false` 关闭）。护栏：产物目录不能是页面目录本身、页面目录的父目录、局部模板目录，也不能是用户主目录；命中直接报错，不会删任何东西。
 - 任一页面渲染失败即整体失败、非零退出，不做静默跳过。
 
 ## 部署
 
-产物是纯静态文件，任何静态托管都能直接用，**不需要 rewrite 规则**：
+产物是纯静态文件，任何静态托管都能直接用。
 
 ```nginx
 server {
     listen 80;
     root /var/www/mysite/dist;
     index index.html;
+
+    # 可选：让无扩展名 URL（/about）在线上也直接命中 about.html，而不是 404
+    location / {
+        try_files $uri $uri.html $uri/index.html $uri/ =404;
+    }
 }
 ```
 
-- **nginx / Apache / Caddy**：把 `dist/` 内容拷进去即可；目录式产物配合 `index index.html` 天然支持 `/about/` 这类 URL。
-- **GitHub Pages / Cloudflare Pages / Netlify / Vercel**：构建命令填 `goweb gen`，发布目录填 `dist`。
+- **GitHub Pages / Cloudflare Pages / Netlify / Vercel**：构建命令填 `goweb gen`，发布目录填 `dist`；这些平台原生支持无扩展名 URL，无需额外配置。
+- **nginx / Apache / Caddy**：把 `dist/` 拷进去即可，`/about.html` 与 `/help/` 开箱可用；想让 `/about` 也直接可用就加上面的 `try_files` 一行。
 - **对象存储（OSS/COS/S3）**：开启静态网站托管并设置索引文档为 `index.html`。
 
 > 直接用 `file://` 双击打开 `dist/index.html` 时，`/static/...` 这类**以 `/` 开头的绝对路径会失效**（根变成了文件系统根）。本地预览请用 `goweb serve`，或把资源链接改成相对路径。
@@ -293,7 +309,7 @@ goweb completion zsh > "${fpath[1]}/_goweb"
 
 ## 设计取舍
 
-- **目录式 URL 优先**：`/about` 与 `/about.html` 一律 301 到 `/about/`，与静态托管对 `<目录>/index.html` 的解析方式对齐，代价是地址栏多一个尾斜杠。
+- **开发服务器零重定向、接受多种写法**：`/about`、`/about/`、`/about.html`、`/about/index.html` 都直接 200，URL 原样保留；代价是同一页面有多个可用 URL，而线上只有 `/about.html` 真实存在（无扩展名写法在 GitHub Pages/Netlify/Cloudflare 原生可用，nginx 需一行 `try_files`），因此**站内链接建议统一写 `/about.html`**。
 - **单一 `html/template` 命名空间**：所有页面与局部模板一起解析，`{{template "x" .}}` 全局可用；代价是不同文件里同名 `define` 会互相覆盖。
 - **不做缺键校验**：JSON 直接解成 map 当模板数据，缺键渲染成空串而不是报错，实现最简且不会误伤 `range`/`with` 内部取值；代价是拼错键名会静默留白。
 - **开发期不做浏览器热刷新**：只重载模板与数据，不注入任何脚本，`gen` 产物因此天然干净。
