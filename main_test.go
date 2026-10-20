@@ -441,6 +441,10 @@ func TestModeAndBuildTimeFlags(t *testing.T) {
 	if got, err := root.PersistentFlags().GetString("build-time"); err != nil || got != "" {
 		t.Fatalf("--build-time 默认值 = %q（err=%v），期望空", got, err)
 	}
+	// 资源版本号默认开启：gen 默认就要做缓存失效。
+	if got, err := root.PersistentFlags().GetBool("fingerprint"); err != nil || !got {
+		t.Fatalf("--fingerprint 默认值 = %v（err=%v），期望 true", got, err)
+	}
 
 	// 非法取值要在真正干活之前就报错（用坏站点也应是参数错误先出现）。
 	if _, _, err := executeCLI("gen", "--mode", "stage"); err == nil ||

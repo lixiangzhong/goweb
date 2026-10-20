@@ -38,6 +38,8 @@ type globalOptions struct {
 	mode string
 	// buildTime 是模板里的构建时间（RFC3339 或 2006-01-02）；留空则取站点内容最新的文件修改时间。
 	buildTime string
+	// fingerprint 表示是否给页面里的站内资源引用自动补 ?v=<内容哈希>。
+	fingerprint bool
 }
 
 func main() {
@@ -136,6 +138,8 @@ func addGlobalFlags(cmd *cobra.Command, globals *globalOptions) {
 		"渲染模式：auto（serve=dev、gen=prod）、dev、prod；模板里用 {{if prod}} 判断")
 	flags.StringVar(&globals.buildTime, "build-time", "",
 		"模板里的构建时间（RFC3339 或 2006-01-02）；留空则取站点内容里最新的文件修改时间")
+	flags.BoolVar(&globals.fingerprint, "fingerprint", true,
+		"给页面里的站内静态资源引用自动补 ?v=<内容哈希>，用于缓存失效；关闭后输出不做任何改写")
 }
 
 // resolveMode 把 --mode 的取值解析成实际模式：auto 时 serve 用 dev、gen 用 prod。
@@ -201,6 +205,7 @@ func runServe(cmd *cobra.Command, opts serveOptions) error {
 		ExcludeDirs: []string{defaultOutDir},
 		Mode:        mode,
 		BuildTime:   buildTime,
+		Fingerprint: opts.globals.fingerprint,
 	})
 	if err != nil {
 		return err
@@ -241,6 +246,7 @@ func runServe(cmd *cobra.Command, opts serveOptions) error {
 		"data", site.DataFile(),
 		"mode", site.Mode(),
 		"buildTime", site.BuildTime().Format(time.RFC3339),
+		"fingerprint", opts.globals.fingerprint,
 		"livereload", opts.liveReload,
 	)
 	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -267,6 +273,7 @@ func runGen(cmd *cobra.Command, opts genOptions) error {
 		ExcludeDirs: []string{opts.out},
 		Mode:        mode,
 		BuildTime:   buildTime,
+		Fingerprint: opts.globals.fingerprint,
 	})
 	if err != nil {
 		return err
@@ -283,6 +290,7 @@ func runGen(cmd *cobra.Command, opts genOptions) error {
 		"data", site.DataFile(),
 		"mode", site.Mode(),
 		"buildTime", site.BuildTime().Format(time.RFC3339),
+		"fingerprint", opts.globals.fingerprint,
 	)
 	return nil
 }

@@ -90,18 +90,22 @@ func TestE2E(t *testing.T) {
 			t.Fatalf("产物未渲染模板或数据: %s", about)
 		}
 
-		// gen 默认是 prod 模式；asset 要带上真实内容哈希；default 兜底可用。
+		// gen 默认是 prod 模式；普通路径的 /static/css/site.css 应被自动补上真实内容哈希。
 		index := readFile(t, filepath.Join(out, "index.html"))
 		if !strings.Contains(index, ">PROD<") {
 			t.Fatalf("gen 产物应处于 prod 模式: %s", index)
 		}
 		cssSum := sha256.Sum256([]byte(".a{color:red}"))
-		wantAsset := `/static/css/site.css?v=` + hex.EncodeToString(cssSum[:])[:assetHashLength]
+		wantAsset := "/static/css/site.css?v=" + hex.EncodeToString(cssSum[:])[:assetHashLength]
 		if !strings.Contains(index, wantAsset) {
-			t.Fatalf("产物里的资源链接应为 %s，实际: %s", wantAsset, index)
+			t.Fatalf("页面里的普通资源引用应被自动补版本号 %s，实际: %s", wantAsset, index)
 		}
 		if !strings.Contains(index, ">E2E-SITE<") {
 			t.Fatalf("局部模板里的 default 兜底未生效: %s", index)
+		}
+		// asset 函数是显式出口，产物里同样生效。
+		if about := readFile(t, filepath.Join(out, "about.html")); !strings.Contains(about, wantAsset) {
+			t.Fatalf("asset 函数应产出带哈希的 URL %s，实际: %s", wantAsset, about)
 		}
 		// 热重载脚本只注入 serve 的响应，产物必须干净。
 		for _, name := range []string{"index.html", "about.html", "help/index.html"} {
@@ -375,6 +379,22 @@ func TestE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("--fingerprint=false 关闭自动版本号", func(t *testing.T) {
+		out := filepath.Join(t.TempDir(), "dist")
+		code, _, stderr := runBinary(t, binary, "gen", "--dir", writeE2ESite(t), "--out", out, "--fingerprint=false")
+		if code != 0 {
+			t.Fatalf("gen 退出码 = %d，期望 0（stderr: %s）", code, stderr)
+		}
+		index := readFile(t, filepath.Join(out, "index.html"))
+		if strings.Contains(index, "site.css?v=") {
+			t.Fatalf("关闭自动改写后普通引用不应带版本号: %s", index)
+		}
+		// asset 是显式出口，即使关闭自动改写也照常生效。
+		if about := readFile(t, filepath.Join(out, "about.html")); !strings.Contains(about, "site.css?v=") {
+			t.Fatalf("asset 函数不受 --fingerprint 影响，应仍带版本号: %s", about)
+		}
+	})
+
 	t.Run("--build-time 可固定构建时间", func(t *testing.T) {
 		// 用独立站点：共享站点在服务端子测试里被改坏过模板。
 		out := filepath.Join(t.TempDir(), "dist")
@@ -523,12 +543,14 @@ func writeE2ESite(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	files := map[string]string{
-		// index 覆盖新模板函数：模式分支、asset 缓存失效、构建时间、default 兜底。
+		// index 用普通路径引用资源（验证自动补版本号）；
+		// about 用 asset 函数（验证显式出口在关闭自动改写时依然有效）。
 		"index.html": `<html><body>{{template "header" .}}<h1>INDEX</h1>` +
 			`<p id="mode">{{if prod}}PROD{{else}}DEV{{end}}</p>` +
-			`<link rel="stylesheet" href="{{asset "/static/css/site.css"}}">` +
+			`<link rel="stylesheet" href="/static/css/site.css">` +
 			`<p id="build">{{buildTime | date "2006-01-02"}}</p></body></html>`,
-		"about.html":                  `<html><body>{{template "header" .}}<h1>ABOUT</h1></body></html>`,
+		"about.html": `<html><body>{{template "header" .}}<h1>ABOUT</h1>` +
+			`<link rel="stylesheet" href="{{asset "/static/css/site.css"}}"></body></html>`,
 		"help/index.html":             `<html><body><h1>HELP-INDEX</h1></body></html>`,
 		"help/74.html":                `<html><body><h1>HELP-74</h1></body></html>`,
 		"templates/header.html":       `{{define "header"}}<header>{{.site.title | default "无标题"}}</header>{{end}}`,

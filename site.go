@@ -52,6 +52,9 @@ type SiteOptions struct {
 	// BuildTime 是模板里的构建时间；为零值时取站点内容里最新的文件修改时间，
 	// 保证「同样的输入产出同样的结果」。
 	BuildTime time.Time
+	// Fingerprint 表示是否给页面里的站内静态资源引用自动补 ?v=<内容哈希>。
+	// 库层默认关闭（单元测试要能断言逐字节输出），CLI 默认开启。
+	Fingerprint bool
 }
 
 // Site 是站点的渲染入口，持有页面清单与共享模板命名空间。
@@ -69,12 +72,16 @@ type Site struct {
 	mode Mode
 	// buildTimeOverride 非零时作为模板里的构建时间。
 	buildTimeOverride time.Time
+	// fingerprint 表示是否自动给资源引用补版本号。
+	fingerprint bool
 
 	mu        sync.RWMutex
 	tmpl      *template.Template
 	pages     map[string]string // 页面模板名 -> 源文件绝对路径
 	data      map[string]any    // 模板数据，来自模板目录下的 data.json
 	buildTime time.Time         // 本次加载使用的构建时间
+	// rewrite 是对页面输出做资源版本号改写的函数；未开启时为 nil。
+	rewrite func(pageName string, body []byte) ([]byte, error)
 }
 
 // siteSnapshot 是一次加载的完整结果，保证模板、页面清单与数据同时生效。
@@ -83,6 +90,7 @@ type siteSnapshot struct {
 	pages     map[string]string
 	data      map[string]any
 	buildTime time.Time
+	rewrite   func(pageName string, body []byte) ([]byte, error)
 }
 
 // LoadSite 扫描页面目录并编译全部模板。
@@ -101,6 +109,7 @@ func LoadSite(opts SiteOptions) (*Site, error) {
 		templatePrefix:    cleanRelativeDir(opts.TemplateDir),
 		mode:              mode,
 		buildTimeOverride: opts.BuildTime,
+		fingerprint:       opts.Fingerprint,
 	}
 	if err := site.Reload(); err != nil {
 		return nil, err
@@ -117,7 +126,8 @@ func (s *Site) Reload() error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tmpl, s.pages, s.data, s.buildTime = snapshot.tmpl, snapshot.pages, snapshot.data, snapshot.buildTime
+	s.tmpl, s.pages, s.data, s.buildTime, s.rewrite =
+		snapshot.tmpl, snapshot.pages, snapshot.data, snapshot.buildTime, snapshot.rewrite
 	return nil
 }
 
@@ -199,6 +209,15 @@ func (s *Site) Render(name string) ([]byte, error) {
 	var buf bytes.Buffer
 	if err := tmpl.Execute(&buf, s.data); err != nil {
 		return nil, fmt.Errorf("渲染 %q: %w", name, err)
+	}
+	// 开启后给站内静态资源引用补 ?v=<内容哈希>；serve 与 gen 共用这条路径，
+	// 保证本地看到的 URL 与产物一致。
+	if s.rewrite != nil {
+		body, err := s.rewrite(name, buf.Bytes())
+		if err != nil {
+			return nil, err
+		}
+		return body, nil
 	}
 	return buf.Bytes(), nil
 }
@@ -331,6 +350,9 @@ func (s *Site) compile() (siteSnapshot, error) {
 		ctx.buildTime = s.buildTimeOverride
 	}
 	snapshot.buildTime = ctx.buildTime
+	if s.fingerprint {
+		snapshot.rewrite = ctx.fingerprintHTML
+	}
 	return snapshot, nil
 }
 
