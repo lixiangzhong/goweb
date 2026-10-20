@@ -59,9 +59,15 @@ jobs:
         run: go tool cover -func=coverage.out | tail -1
 
       - name: Unit tests with race detector
-        # Windows 上 -race 需要 gcc/mingw 工具链，这里不依赖它；Linux 与 macOS 仍全量跑。
-        if: runner.os != 'Windows'
-        run: go test -short -count=1 -race ./...
+        # Go 的竞态检测器需要 cgo + C 编译器；Windows 镜像不一定带 gcc。
+        # 没有编译器时显式跳过并打出 notice（不静默降级），三平台共用同一条命令。
+        shell: bash
+        run: |
+          if ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
+            echo "::notice::未找到 C 编译器，跳过 -race（竞态检测器需要 cgo）"
+            exit 0
+          fi
+          go test -short -count=1 -race ./...
 
       - name: E2E tests (real binary + HTTP + hot reload)
         run: go test -count=1 -run TestE2E ./...
