@@ -2,13 +2,12 @@ package main
 
 import (
 	"errors"
-	"flag"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
-	"strings"
+
+	"github.com/spf13/cobra"
 )
 
 const (
@@ -22,63 +21,118 @@ const (
 	defaultOutDir = "dist"
 )
 
-// serveOptions 是 serve 子命令的参数。
-type serveOptions struct {
-	addr        string
-	dir         string
-	templateDir string
-}
+// version 是版本号，构建时可通过 -ldflags "-X main.version=v1.0.0" 注入。
+var version = "dev"
 
-// genOptions 是 gen 子命令的参数。
-type genOptions struct {
+// globalOptions 是根命令与各子命令共用的参数（persistent flag）。
+type globalOptions struct {
 	dir         string
 	templateDir string
-	out         string
-	clean       bool
 }
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "goweb:", err)
+	// 错误信息与 usage 由 cobra 打印（前缀 goweb:），这里只负责退出码。
+	if err := newRootCommand().Execute(); err != nil {
 		os.Exit(1)
 	}
 }
 
-// run 解析子命令并分发；不带子命令时默认启动开发服务器。
-func run(args []string) error {
-	command := "serve"
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		command, args = args[0], args[1:]
-	}
+// newRootCommand 组装整个 CLI。不带子命令时等价于 serve，因此根命令自带 --addr。
+func newRootCommand() *cobra.Command {
+	globals := &globalOptions{}
+	var addr string
 
-	switch command {
-	case "serve":
-		return runServe(args)
-	case "gen":
-		return runGen(args)
-	case "help", "-h", "--help":
-		printUsage(os.Stdout)
-		return nil
-	default:
-		return fmt.Errorf("未知子命令 %q，可用：serve、gen", command)
+	root := &cobra.Command{
+		Use:     "goweb",
+		Short:   "面向前端开发的静态站服务器与静态化工具",
+		Long:    rootLongDescription,
+		Example: rootExample,
+		Version: version,
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			// 参数已解析完成，运行期错误不再刷 usage。
+			cmd.SilenceUsage = true
+			return runServe(cmd, serveOptions{addr: addr, globals: globals})
+		},
 	}
+	// 统一错误前缀（形如 goweb: ...），并与 usage 的输出顺序保持一致。
+	root.SetErrPrefix("goweb:")
+	addGlobalFlags(root, globals)
+	root.Flags().StringVarP(&addr, "addr", "a", defaultAddr, "监听地址（根命令等价于 serve）")
+
+	root.AddCommand(newServeCommand(globals), newGenCommand(globals))
+	return root
 }
 
-// runServe 启动开发服务器：目录式路由 + 模板渲染 + 静态文件直出，模板或数据变更后自动重载。
-func runServe(args []string) error {
-	var opts serveOptions
-	flags := serveFlagSet(&opts, os.Stderr)
-	if err := flags.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return nil
-		}
-		return err
-	}
+// newServeCommand 构造 serve 子命令：行为与不带子命令的根命令一致。
+func newServeCommand(globals *globalOptions) *cobra.Command {
+	var addr string
 
-	logger := newLogger()
+	cmd := &cobra.Command{
+		Use:     "serve",
+		Short:   "启动开发服务器",
+		Long:    "启动开发服务器：目录式路由 + 模板渲染 + 静态文件直出；模板或 data.json 变更后自动重载，浏览器手动刷新即可。",
+		Example: serveExample,
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cmd.SilenceUsage = true
+			return runServe(cmd, serveOptions{addr: addr, globals: globals})
+		},
+	}
+	cmd.Flags().StringVarP(&addr, "addr", "a", defaultAddr, "监听地址")
+	return cmd
+}
+
+// newGenCommand 构造 gen 子命令：渲染全部页面并产出纯静态站。
+func newGenCommand(globals *globalOptions) *cobra.Command {
+	var out string
+	var clean bool
+
+	cmd := &cobra.Command{
+		Use:     "gen",
+		Short:   "渲染模板并产出纯静态站",
+		Long:    "渲染模板并产出纯静态站：页面按目录式落盘，其余文件原样拷贝；生成前清空产物目录，任一页面渲染失败即整体失败。",
+		Example: genExample,
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cmd.SilenceUsage = true
+			return runGen(cmd, genOptions{globals: globals, out: out, clean: clean})
+		},
+	}
+	cmd.Flags().StringVarP(&out, "out", "o", defaultOutDir, "产物目录")
+	cmd.Flags().BoolVarP(&clean, "clean", "c", true, "生成前清空产物目录")
+	return cmd
+}
+
+// addGlobalFlags 挂载根命令与子命令共用的参数。
+// 用 persistent flag 是为了让 `goweb --dir site gen` 这类写法同样生效，
+// 而不是被父命令静默吞掉。
+func addGlobalFlags(cmd *cobra.Command, globals *globalOptions) {
+	flags := cmd.PersistentFlags()
+	flags.StringVarP(&globals.dir, "dir", "d", defaultPageDir, "页面目录")
+	flags.StringVarP(&globals.templateDir, "template", "t", defaultTemplateDir,
+		"局部模板目录（相对页面目录），data.json 也在其中；置空表示没有")
+}
+
+// serveOptions 是 serve 的参数。
+type serveOptions struct {
+	globals *globalOptions
+	addr    string
+}
+
+// genOptions 是 gen 的参数。
+type genOptions struct {
+	globals *globalOptions
+	out     string
+	clean   bool
+}
+
+// runServe 启动开发服务器。
+func runServe(cmd *cobra.Command, opts serveOptions) error {
+	logger := newLogger(cmd.ErrOrStderr())
 	site, err := LoadSite(SiteOptions{
-		Dir:         opts.dir,
-		TemplateDir: opts.templateDir,
+		Dir:         opts.globals.dir,
+		TemplateDir: opts.globals.templateDir,
 		ExcludeDirs: []string{defaultOutDir},
 	})
 	if err != nil {
@@ -109,20 +163,11 @@ func runServe(args []string) error {
 }
 
 // runGen 渲染全部页面并产出纯静态站。
-func runGen(args []string) error {
-	var opts genOptions
-	flags := genFlagSet(&opts, os.Stderr)
-	if err := flags.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return nil
-		}
-		return err
-	}
-
-	logger := newLogger()
+func runGen(cmd *cobra.Command, opts genOptions) error {
+	logger := newLogger(cmd.ErrOrStderr())
 	site, err := LoadSite(SiteOptions{
-		Dir:         opts.dir,
-		TemplateDir: opts.templateDir,
+		Dir:         opts.globals.dir,
+		TemplateDir: opts.globals.templateDir,
 		ExcludeDirs: []string{opts.out},
 	})
 	if err != nil {
@@ -142,83 +187,40 @@ func runGen(args []string) error {
 	return nil
 }
 
-// serveFlagSet 声明 serve 子命令的参数。
-func serveFlagSet(opts *serveOptions, output io.Writer) *flag.FlagSet {
-	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
-	flags.SetOutput(output)
-	flags.StringVar(&opts.addr, "addr", defaultAddr, "监听地址")
-	flags.StringVar(&opts.dir, "dir", defaultPageDir, "页面目录")
-	flags.StringVar(&opts.templateDir, "template", defaultTemplateDir, "局部模板目录（相对页面目录，空表示没有）")
-	return flags
+// newLogger 构造开发期日志器，输出到给定 writer（默认标准错误）。
+func newLogger(w io.Writer) *slog.Logger {
+	if w == nil {
+		w = os.Stderr
+	}
+	return slog.New(slog.NewTextHandler(w, nil))
 }
 
-// genFlagSet 声明 gen 子命令的参数。
-func genFlagSet(opts *genOptions, output io.Writer) *flag.FlagSet {
-	flags := flag.NewFlagSet("gen", flag.ContinueOnError)
-	flags.SetOutput(output)
-	flags.StringVar(&opts.dir, "dir", defaultPageDir, "页面目录")
-	flags.StringVar(&opts.templateDir, "template", defaultTemplateDir, "局部模板目录（相对页面目录，空表示没有）")
-	flags.StringVar(&opts.out, "out", defaultOutDir, "产物目录")
-	flags.BoolVar(&opts.clean, "clean", true, "生成前清空产物目录")
-	return flags
-}
+const rootLongDescription = `goweb 用两个子命令覆盖「本地写页面 → 产出静态站」的完整流程：
 
-// newLogger 构造开发期日志器，输出到标准错误。
-func newLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(os.Stderr, nil))
-}
+  serve   起开发服务器，页面 URL 与静态托管严格一致，改完自动重载
+  gen     渲染模板产出纯静态站，可直接部署
 
-// printUsage 输出总览帮助，含两个子命令的参数说明。
-func printUsage(w io.Writer) {
-	fmt.Fprint(w, usageText)
-
-	var serveOpts serveOptions
-	fmt.Fprint(w, "\nserve 参数（goweb serve -h）：\n")
-	serveFlagSet(&serveOpts, w).PrintDefaults()
-
-	var genOpts genOptions
-	fmt.Fprint(w, "\ngen 参数（goweb gen -h）：\n")
-	genFlagSet(&genOpts, w).PrintDefaults()
-}
-
-const usageText = `goweb —— 面向前端开发的静态站服务器与静态化工具
-
-用法：
-  goweb [serve] [参数]    启动开发服务器（默认监听 :8080）
-  goweb gen [参数]        渲染模板并产出纯静态站
-  goweb help              显示本帮助
-
-示例：
-  cd 站点目录
-  goweb                       # 浏览器打开 http://localhost:8080/
-  goweb gen -out dist         # 产出可直接部署的静态站到 dist/
+不带子命令时等价于 serve，直接在当前目录起开发服务器。
 
 目录约定：
-  页面目录（-dir，默认 .）中递归出现的 *.html 都是页面：
-    index.html    -> /
-    about.html    -> /about/
-    help/74.html  -> /help/74/
-  局部模板目录（-template，默认 templates）里的 html 只参与模板解析，
-  不产出页面、也不能被直接访问。
-
-模板写法：
-  页面与局部模板共用同一个 html/template 命名空间：
-    局部模板 templates/header.html：{{define "header"}}...{{end}}
-    页面 about.html：{{template "header" .}}
-  模板数据来自 templates/data.json 的顶层对象，页面与局部模板共用：
-    data.json：{"site":{"title":"我的站点"},"year":2026}
-    模板里：{{.site.title}} / {{.year}}
-  数据文件缺失表示没有数据；JSON 语法错误或顶层不是对象会直接报错；
-  缺键按 Go 模板原生语义渲染成空字符串（写错键名只会留白，不会报错）。
-  内置模板函数：
-    {{"<b>x</b>"|HTML}}   原样输出为 HTML
-    {{JS "x"}}            编码为 JSON 字面量
-  扫描时忽略：点号开头的文件/目录、node_modules、产物目录（dist）。
+  页面目录（--dir，默认 .）中递归出现的 *.html 都是页面：
+    index.html -> /      about.html -> /about/      help/74.html -> /help/74/
+  局部模板目录（--template，默认 templates）里的 html 只参与模板解析、不产出页面，
+  也不能被直接访问；templates/data.json 的顶层对象是所有页面共用的模板数据。
 
 URL 规则（与 gen 产物布局严格一致）：
-  /、/about/、/help/74/ 是唯一 URL；/about、/about.html、/index.html
-  一律 301 到目录 URL；未命中页面时按磁盘真实文件直出；
-  其余返回纯文本 404（无自定义 404 约定、无目录列表）。
-  模板目录整体不可直接访问（含 data.json）。
-  模板或数据变更后自动重载，但不注入热刷新脚本，需要手动刷新浏览器。
-`
+  /、/about/、/help/74/ 是唯一 URL；/about、/about.html、/index.html 一律 301
+  到目录 URL；未命中页面时按磁盘真实文件直出；其余返回纯文本 404。`
+
+const rootExample = `  goweb                        # 等价于 goweb serve，访问 http://localhost:8080/
+  goweb --addr :3000           # 换端口
+  goweb --dir site gen         # 公共参数写在哪一层都生效
+  goweb gen --out public       # 产出到 public/`
+
+const serveExample = `  goweb serve
+  goweb serve --addr :3000
+  goweb serve --dir site --template templates`
+
+const genExample = `  goweb gen
+  goweb gen --out public
+  goweb gen --clean=false`
