@@ -12,7 +12,7 @@
 - **`goweb serve`** —— 在站点目录起开发服务器。产物与源码一一对应，开发服务器不做任何尾斜杠/扩展名重定向，改完模板或数据自动重新加载。
 - **`goweb gen`** —— 把页面渲染成纯静态站，产出 `dist/`，拷到任何静态托管即可上线。
 
-不需要 npm、webpack、vite，没有配置文件，只依赖标准库 + [cobra](https://github.com/spf13/cobra) + [fsnotify](https://github.com/fsnotify/fsnotify)。
+不需要 npm、webpack、vite，没有配置文件，只依赖标准库 + [cobra](https://github.com/spf13/cobra) + [fsnotify](https://github.com/fsnotify/fsnotify) + [x/net/html](https://pkg.go.dev/golang.org/x/net/html)。
 
 ## 目录
 
@@ -22,6 +22,7 @@
 - [目录约定](#目录约定)
 - [模板](#模板)
 - [模板数据](#模板数据)
+- [静态资源与缓存失效](#静态资源与缓存失效)
 - [URL 规则](#url-规则)
 - [浏览器热重载](#浏览器热重载)
 - [生成静态站](#生成静态站)
@@ -41,13 +42,14 @@
 - **复用页头页脚**：直接用 Go 的 `html/template`，`{{define}}` + `{{template}}` 抽公共片段，不需要学新语法。
 - **站点级数据**：`templates/data.json` 提供站名、备案号、导航等共享变量，页面与局部模板都能取。
 - **保存即可见**：页面、模板、`data.json` 或静态资源变更后自动重载，并通过 SSE 让浏览器自动刷新；改到一半的坏模板不会让服务挂掉，也不会触发刷新。
+- **缓存失效自动做**：页面里写普通的 `/static/css/site.css`，`gen` 与 `serve` 都会自动补上 `?v=<内容哈希>`；外链、`data:`、已带查询串的写法一律不动（`--fingerprint=false` 可关闭）。
 - **一条命令静态化**：`goweb gen` 原地产出 `dist/`，其余文件原样拷贝。
 - **危险操作有护栏**：清空产物目录前会拦截页面目录本身、其父目录、局部模板目录与用户主目录。
 - **快速失败**：任一页面渲染失败即整体失败、非零退出，绝不把半成品产物当成成功发布。
 
 ## 安装
 
-需要 Go 1.25 或更高版本。
+需要 Go 1.26 或更高版本（`x/net` 的要求；预编译二进制不需要 Go 环境）。
 
 ```bash
 go install github.com/lixiangzhong/goweb@latest
@@ -197,7 +199,7 @@ dist/static/css/site.css
 | --- | --- | --- |
 | `HTML` | `{{"<b>粗</b>"\|HTML}}` | 原样输出 HTML，不再转义 |
 | `JS` | `<script>const c = {{JS "x"}};</script>` | 值编码为 JSON 字面量 |
-| `asset` | `{{asset "/static/css/site.css"}}` | → `/static/css/site.css?v=<内容哈希>`，缓存失效用；文件不存在、指向页面或落在模板目录/忽略项里都会**直接报错** |
+| `asset` | `{{asset "/static/css/site.css"}}` | → `/static/css/site.css?v=<内容哈希>`。页面里的**普通路径会被自动补哈希**（见[静态资源与缓存失效](#静态资源与缓存失效)），这个函数用于自动改写覆盖不到的地方（CSS `url()`、内联 JS）；文件不存在、指向页面或落在模板目录/忽略项里都会**直接报错** |
 | `default` | `{{.site.title \| default "未命名"}}` | 值为空（nil、`""`、0、false、空切片/映射）时用兜底值，补「缺键渲染为空」的坑 |
 | `fail` | `{{if not .site.title}}{{fail "缺少 site.title"}}{{end}}` | 渲染直接失败：`gen` 非零退出、`serve` 回 500，消息带出来 |
 | `dict` / `list` | `{{template "card" dict "title" .t "url" .u}}` | 构造 map / 切片，给局部模板传多个参数 |
@@ -260,6 +262,32 @@ goweb gen --build-time 2026-03-05T10:30:00Z
 - **缺键不报错**：数据里没有的键（例如把 `site.title` 写成 `site.titl`）按 Go 模板原生语义渲染成空字符串，只会静默留白，需要自己核对键名。
 - `data.json` 只是模板数据源，不会进入产物目录，也不能被直接访问。
 - 数据是**站点级共享**的；页面之间的差异直接写在各自的 html 里。
+
+## 静态资源与缓存失效
+
+页面里写普通的站内路径即可，`serve` 与 `gen` 都会自动补上内容哈希：
+
+```html
+<link rel="stylesheet" href="/static/css/site.css">
+<!-- 输出：<link rel="stylesheet" href="/static/css/site.css?v=15c42ab7"> -->
+```
+
+规则（按属性白名单，只动站内真实存在的静态资源）：
+
+| 项 | 行为 |
+| --- | --- |
+| 属性 | `href`、`src`、`poster`、`data-src`、`srcset`（多候选逐个处理，保留 `1x`/`2x` 描述符） |
+| 路径 | 根绝对路径（`/static/a.css`）与相对路径（按页面所在目录解析，如 `help/74.html` 里写 `../static/a.css`） |
+| 跳过 | 外链 `https://`、协议相对 `//cdn`、`data:`/`mailto:`/`tel:`、锚点 `#x`，以及**已带查询串或锚点**的值（版本号交给你自己控制） |
+| 跳过 | 指向页面的链接（`/about.html`）、局部模板目录、忽略项、不存在的文件 |
+| 不改 | `<style>` 内、`style="…"` 内与独立 CSS 文件里的 `url(...)`；需要时用 `{{asset}}` 或自己加版本号 |
+
+两个实现细节值得知道：
+
+- **只有真的改动了才会重排 HTML**：改写走 HTML 解析器（`x/net/html`），而解析会规范化格式（补齐 `<head>`、统一引号与自闭合、实体解码）。因此实现里加了一层保护——页面里没有可改写的资源时，输出**逐字节保持原样**，把副作用限制在确实需要版本号的页面上。
+- **哈希来自文件内容**（sha256 前 8 位），与 `{{asset}}` 用的是同一个值；内容变了 URL 就变，浏览器自然会取新文件。
+
+不想要查询串、或需要逐字节对照渲染结果时用 `--fingerprint=false` 关闭（`{{asset}}` 是显式出口，不受该开关影响）。
 
 ## URL 规则
 
@@ -379,6 +407,7 @@ goweb --version
 | `--out` | `-o` | gen | `dist` | 产物目录 |
 | `--clean` | `-c` | gen | `true` | 生成前清空产物目录 |
 | `--livereload` | `-l` | serve（含不带子命令） | `true` | 注入热重载脚本并开放 SSE 端点；`--livereload=false` 关闭 |
+| `--fingerprint` | — | 全部 | `true` | 自动给页面里的站内资源引用补 `?v=<内容哈希>`；`--fingerprint=false` 关闭 |
 | `--mode` | — | 全部 | `auto` | 渲染模式：`auto`（serve=dev、gen=prod）、`dev`、`prod` |
 | `--build-time` | — | 全部 | 空（取站点最新修改时间） | 模板里的构建时间，RFC3339 或 `2006-01-02` |
 | `--version` | `-v` | 根命令（`goweb --version`） | — | 打印版本号（`dev`，除非构建时用 `-ldflags` 注入） |
