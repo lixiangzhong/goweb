@@ -12,7 +12,7 @@
 - **`goweb serve`** —— 在站点目录起开发服务器。页面 URL 与最终静态托管（nginx / GitHub Pages）**严格一致**，改完模板或数据自动重新加载。
 - **`goweb gen`** —— 把页面渲染成纯静态站，产出 `dist/`，拷到任何静态托管即可上线。
 
-不需要 npm、webpack、vite，没有配置文件，只依赖标准库 + [fsnotify](https://github.com/fsnotify/fsnotify)。
+不需要 npm、webpack、vite，没有配置文件，只依赖标准库 + [cobra](https://github.com/spf13/cobra) + [fsnotify](https://github.com/fsnotify/fsnotify)。
 
 ## 目录
 
@@ -57,6 +57,9 @@ go install github.com/lixiangzhong/goweb@latest
 git clone https://github.com/lixiangzhong/goweb.git
 cd goweb
 go build -o goweb .
+
+# 带上版本号（goweb --version 会显示它）
+go build -ldflags "-X main.version=$(git describe --tags --always --dirty)" -o goweb .
 ```
 
 ## 快速开始
@@ -137,15 +140,15 @@ dist/static/css/site.css
 
 | 路径 | 作用 |
 | --- | --- |
-| 页面目录（`-dir`，默认当前目录） | 其中递归出现的 `*.html` 都是页面 |
-| `-template`（默认 `templates/`） | 局部模板目录：内部 html 只参与模板解析，不产出页面、也不能被直接访问；`data.json` 也放在这里 |
+| 页面目录（`--dir`，默认当前目录） | 其中递归出现的 `*.html` 都是页面 |
+| `--template`（默认 `templates/`） | 局部模板目录：内部 html 只参与模板解析，不产出页面、也不能被直接访问；`data.json` 也放在这里 |
 | 其他任意文件/目录 | 视为静态资源，`gen` 时原样拷贝进产物、`serve` 时直接对外提供 |
 
 扫描时固定忽略：
 
 - 以 `.` 开头的文件与目录（`.git`、`.DS_Store` 等）
 - `node_modules/`
-- 产物目录（`serve` 固定忽略 `dist/`，`gen` 忽略 `-out` 指定的目录）
+- 产物目录（`serve` 固定忽略 `dist/`，`gen` 忽略 `--out` 指定的目录）
 
 ## 模板
 
@@ -220,10 +223,10 @@ dist/static/css/site.css
 ## 生成静态站
 
 ```bash
-goweb gen                      # 产出到 dist/
-goweb gen -out public          # 换产物目录
-goweb gen -clean=false         # 不清空，只覆盖同名文件
-goweb gen -dir site -template templates
+goweb gen                          # 产出到 dist/
+goweb gen --out public             # 换产物目录（-o）
+goweb gen --clean=false            # 不清空，只覆盖同名文件（-c=false）
+goweb gen --dir site --template templates
 ```
 
 产物布局与源码一一对应：
@@ -239,7 +242,7 @@ dist/
 
 - 页面按目录式落盘：`about.html` → `dist/about/index.html`（`index` 页落在所在目录的 `index.html`）。
 - 除页面、局部模板目录、忽略项之外的所有文件**原样拷贝**，相对路径不变。
-- 生成前清空产物目录（`-clean=false` 关闭）。护栏：产物目录不能是页面目录本身、页面目录的父目录、局部模板目录，也不能是用户主目录；命中直接报错，不会删任何东西。
+- 生成前清空产物目录（`--clean=false` 关闭）。护栏：产物目录不能是页面目录本身、页面目录的父目录、局部模板目录，也不能是用户主目录；命中直接报错，不会删任何东西。
 - 任一页面渲染失败即整体失败、非零退出，不做静默跳过。
 
 ## 部署
@@ -263,18 +266,30 @@ server {
 ## 命令与参数
 
 ```bash
-goweb [serve] [-addr :8080] [-dir .] [-template templates]
-goweb gen     [-dir .] [-template templates] [-out dist] [-clean=true]
-goweb help
+goweb [serve] [--addr :8080] [--dir .] [--template templates]
+goweb gen     [--dir .] [--template templates] [--out dist] [--clean=true]
+goweb completion bash|zsh|fish|powershell      # 生成 shell 补全脚本
+goweb help [command]
+goweb --version
 ```
 
-| 参数 | 适用 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `-addr` | serve | `:8080` | 监听地址 |
-| `-dir` | 全部 | `.` | 页面目录 |
-| `-template` | 全部 | `templates` | 局部模板目录（相对页面目录），`data.json` 也在其中；置空表示没有 |
-| `-out` | gen | `dist` | 产物目录 |
-| `-clean` | gen | `true` | 生成前清空产物目录 |
+`goweb` 不带子命令时等价于 `goweb serve`；`--dir` 与 `--template` 是公共参数，写在子命令前后都可以（`goweb --dir site gen` 与 `goweb gen --dir site` 等价）。
+
+| 参数 | 短选项 | 适用 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `--addr` | `-a` | serve（含不带子命令） | `:8080` | 监听地址 |
+| `--dir` | `-d` | 全部 | `.` | 页面目录 |
+| `--template` | `-t` | 全部 | `templates` | 局部模板目录（相对页面目录），`data.json` 也在其中；置空表示没有 |
+| `--out` | `-o` | gen | `dist` | 产物目录 |
+| `--clean` | `-c` | gen | `true` | 生成前清空产物目录 |
+| `--version` | `-v` | 根命令（`goweb --version`） | — | 打印版本号（`dev`，除非构建时用 `-ldflags` 注入） |
+| `--help` | `-h` | 全部 | — | 查看帮助，如 `goweb gen --help` |
+
+启用 shell 补全（以 zsh 为例）：
+
+```bash
+goweb completion zsh > "${fpath[1]}/_goweb"
+```
 
 ## 设计取舍
 
@@ -283,6 +298,7 @@ goweb help
 - **不做缺键校验**：JSON 直接解成 map 当模板数据，缺键渲染成空串而不是报错，实现最简且不会误伤 `range`/`with` 内部取值；代价是拼错键名会静默留白。
 - **开发期不做浏览器热刷新**：只重载模板与数据，不注入任何脚本，`gen` 产物因此天然干净。
 - **渲染失败即失败**：宁可让 `gen` 报错退出，也不产出一个缺页面的半成品静态站。
+- **用 cobra 而不是标准库 `flag`**：换来统一的 `--help`/`--version`/shell 补全与更清晰的子命令结构，代价是多两个间接依赖（pflag、mousetrap）；公共参数（`--dir`/`--template`）做成 persistent flag，保证 `goweb --dir site gen` 不会被静默忽略。
 
 ## 目前不做
 
@@ -318,7 +334,7 @@ CI 在 Ubuntu 与 macOS 上运行 `gofmt` 检查、`go mod tidy` 校验、`go ve
 1. Fork 并新建分支。
 2. 提交前确保 `gofmt -l .` 无输出、`go vet ./...` 与 `go test ./...` 全部通过。
 3. 新增行为请补上对应的单元测试。
-4. Commit message 沿用 `<type>(<scope>): <summary>`（如 `feat(gen): 支持 -clean=false`）。
+4. Commit message 沿用 `<type>(<scope>): <summary>`（如 `feat(gen): 支持 --clean=false`）。
 
 ## 许可证
 
