@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	// reloadDebounce 是文件变更后触发模板重编译的防抖窗口，避免连续保存时反复重编译。
+	// reloadDebounce 是文件变更后触发站点重载的防抖窗口，避免连续保存时反复重载。
 	reloadDebounce = 150 * time.Millisecond
 	// readHeaderTimeout 限制请求头读取时间，避免连接被长时间占用。
 	readHeaderTimeout = 10 * time.Second
@@ -119,7 +119,7 @@ func (r *statusRecorder) Write(body []byte) (int, error) {
 	return r.ResponseWriter.Write(body)
 }
 
-// siteWatcher 监听站点文件变更并在防抖后重编译模板。
+// siteWatcher 监听站点文件变更并在防抖后重载模板与数据。
 type siteWatcher struct {
 	site    *Site
 	logger  *slog.Logger
@@ -148,7 +148,7 @@ func watchSite(site *Site, logger *slog.Logger) (func(), error) {
 	return func() { watcher.Close() }, nil
 }
 
-// loop 消费文件系统事件，忽略产物与隐藏项，其余触发防抖重编译。
+// loop 消费文件系统事件，忽略产物与隐藏项，其余触发防抖重载。
 func (w *siteWatcher) loop() {
 	for {
 		select {
@@ -169,7 +169,7 @@ func (w *siteWatcher) loop() {
 	}
 }
 
-// schedule 在防抖窗口结束后重编译模板。
+// schedule 在防抖窗口结束后重载站点。
 func (w *siteWatcher) schedule() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -180,13 +180,13 @@ func (w *siteWatcher) schedule() {
 	w.timer.Reset(reloadDebounce)
 }
 
-// reload 重编译模板并补挂新增目录的监听。
-// 编译失败说明模板正改到一半，此时保留上一份可用模板并报错，不让开发服务器挂掉。
+// reload 重载模板与 data.json，并补挂新增目录的监听。
+// 重载失败说明模板或数据正改到一半，此时保留上一份可用内容并报错，不让开发服务器挂掉。
 func (w *siteWatcher) reload() {
 	if err := w.site.Reload(); err != nil {
-		w.logger.Error("模板重编译失败，继续使用上一份模板", "err", err)
+		w.logger.Error("站点重载失败，继续使用上一份模板与数据", "err", err)
 	} else {
-		w.logger.Info("模板已重编译", "pages", len(w.site.Pages()))
+		w.logger.Info("站点已重载", "pages", len(w.site.Pages()))
 	}
 	if err := w.addPaths(); err != nil {
 		w.logger.Warn("补挂文件监听失败", "err", err)

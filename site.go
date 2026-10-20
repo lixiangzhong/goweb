@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -20,6 +22,8 @@ const (
 	indexName = "index"
 	// nodeModulesDir 是扫描时固定跳过的前端依赖目录。
 	nodeModulesDir = "node_modules"
+	// dataFileName 是模板目录下的数据文件，其顶层 JSON 对象即模板的渲染数据。
+	dataFileName = "data.json"
 )
 
 // SiteOptions 描述站点目录约定，serve 与 gen 共用。
@@ -35,7 +39,8 @@ type SiteOptions struct {
 
 // Site 是站点的渲染入口，持有页面清单与共享模板命名空间。
 // 所有页面与局部模板解析进同一个 html/template 命名空间，因此局部模板的
-// {{define "x"}} 能被任意页面 {{template "x" .}} 引用。
+// {{define "x"}} 能被任意页面 {{template "x" .}} 引用；
+// 模板数据来自模板目录下的 data.json，页面与局部模板共用同一份数据。
 type Site struct {
 	// root 是页面目录的绝对路径。
 	root string
@@ -47,6 +52,14 @@ type Site struct {
 	mu    sync.RWMutex
 	tmpl  *template.Template
 	pages map[string]string // 页面模板名 -> 源文件绝对路径
+	data  map[string]any    // 模板数据，来自模板目录下的 data.json
+}
+
+// siteSnapshot 是一次加载的完整结果，保证模板、页面清单与数据同时生效。
+type siteSnapshot struct {
+	tmpl  *template.Template
+	pages map[string]string
+	data  map[string]any
 }
 
 // LoadSite 扫描页面目录并编译全部模板。
@@ -69,13 +82,13 @@ func LoadSite(opts SiteOptions) (*Site, error) {
 // Reload 重新扫描并编译模板；失败时保留原有模板集合，因此调用方可以自行决定
 // 是致命退出（首次加载）还是继续用上一份可用模板（开发期热重编译）。
 func (s *Site) Reload() error {
-	tmpl, pages, err := s.compile()
+	snapshot, err := s.compile()
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tmpl, s.pages = tmpl, pages
+	s.tmpl, s.pages, s.data = snapshot.tmpl, snapshot.pages, snapshot.data
 	return nil
 }
 
@@ -96,11 +109,18 @@ func (s *Site) Pages() []string {
 	return names
 }
 
-// pageData 是传给模板的渲染数据。站点没有数据源，所以它是一个空结构体：
-// 页面里误写 {{.Field}} 会因为字段不存在而直接报错，而不是静默渲染成空字符串。
-type pageData struct{}
+// DataFile 返回数据文件路径；没有配置局部模板目录时返回空字符串。
+func (s *Site) DataFile() string {
+	if s.templatePrefix == "" {
+		return ""
+	}
+	return filepath.Join(s.root, filepath.FromSlash(s.templatePrefix), dataFileName)
+}
 
-// Render 渲染指定模板并返回 HTML 内容，渲染数据固定为空（页面不依赖外部数据）。
+// Render 渲染指定模板并返回 HTML 内容，渲染数据为 data.json 的顶层对象。
+//
+// 数据是普通 map，缺键按 Go 模板原生语义渲染成空字符串（例如页面写错
+// {{.site.titl}} 不会报错，只是留白），拼写错误需要自行核对。
 func (s *Site) Render(name string) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -109,7 +129,7 @@ func (s *Site) Render(name string) ([]byte, error) {
 		return nil, fmt.Errorf("模板 %q 不存在", name)
 	}
 	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, pageData{}); err != nil {
+	if err := tmpl.Execute(&buf, s.data); err != nil {
 		return nil, fmt.Errorf("渲染 %q: %w", name, err)
 	}
 	return buf.Bytes(), nil
@@ -166,10 +186,12 @@ func (s *Site) WatchPaths() ([]string, error) {
 	return paths, nil
 }
 
-// compile 构造新的模板命名空间与页面清单，任一步失败即整体失败。
-func (s *Site) compile() (*template.Template, map[string]string, error) {
-	tmpl := template.New(s.root)
-	pages := make(map[string]string)
+// compile 构造一次完整快照：模板命名空间、页面清单与 data.json 数据，
+// 任一步失败即整体失败。
+func (s *Site) compile() (siteSnapshot, error) {
+	var snapshot siteSnapshot
+	snapshot.tmpl = template.New(s.root)
+	snapshot.pages = make(map[string]string)
 
 	err := filepath.WalkDir(s.root, func(filePath string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -197,18 +219,45 @@ func (s *Site) compile() (*template.Template, map[string]string, error) {
 		if err != nil {
 			return fmt.Errorf("读取模板 %s: %w", rel, err)
 		}
-		if _, err := tmpl.New(name).Funcs(templateFuncs()).Parse(string(body)); err != nil {
+		if _, err := snapshot.tmpl.New(name).Funcs(templateFuncs()).Parse(string(body)); err != nil {
 			return fmt.Errorf("解析模板 %s: %w", rel, err)
 		}
 		if !s.isTemplateFile(rel) {
-			pages[name] = filePath
+			snapshot.pages[name] = filePath
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, nil, err
+		return snapshot, err
 	}
-	return tmpl, pages, nil
+
+	data, err := s.loadData()
+	if err != nil {
+		return snapshot, err
+	}
+	snapshot.data = data
+	return snapshot, nil
+}
+
+// loadData 读取模板目录下的 data.json 作为模板数据。
+// 文件不存在表示没有数据（不报错）；JSON 语法错误或顶层不是对象则报错。
+func (s *Site) loadData() (map[string]any, error) {
+	dataPath := s.DataFile()
+	if dataPath == "" {
+		return nil, nil
+	}
+	body, err := os.ReadFile(dataPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("读取数据文件 %s: %w", dataPath, err)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil, fmt.Errorf("解析数据文件 %s（顶层必须是 JSON 对象）: %w", dataPath, err)
+	}
+	return data, nil
 }
 
 // skipPath 判断扫描阶段是否跳过某个路径：点号开头的隐藏项、node_modules 与显式排除目录。
@@ -276,6 +325,7 @@ type Route struct {
 //
 // 规则与 gen 的产物布局严格一致：页面 URL 一定以 / 结尾，与静态托管
 // （nginx / GitHub Pages / file://）对 <dir>/index.html 的解析方式相同。
+// 局部模板目录整体不可访问（含 data.json 这类非 html 文件）。
 func (s *Site) Resolve(urlPath string) Route {
 	canonical := canonicalPath(urlPath)
 	if canonical != urlPath {
@@ -309,7 +359,7 @@ func (s *Site) Resolve(urlPath string) Route {
 		if s.hasPageURL(name + "/") {
 			return Route{Kind: RouteRedirect, Location: canonical + "/"}
 		}
-		if filePath, ok := s.filePath(canonical); ok {
+		if filePath, ok := s.filePath(canonical); ok && !s.WithinTemplateDir(filePath) {
 			if info, err := os.Stat(filePath); err == nil && !info.IsDir() {
 				return Route{Kind: RouteFile, File: filePath}
 			}

@@ -23,12 +23,12 @@ func writeSite(t *testing.T, files map[string]string) string {
 	return dir
 }
 
-// loadTestSite 铺站点并加载，测试里统一使用 template 作为局部模板目录、dist 作为产物目录。
+// loadTestSite 铺站点并加载，测试里统一使用 templates 作为局部模板目录、dist 作为产物目录。
 func loadTestSite(t *testing.T, files map[string]string) *Site {
 	t.Helper()
 	site, err := LoadSite(SiteOptions{
 		Dir:         writeSite(t, files),
-		TemplateDir: "template",
+		TemplateDir: "templates",
 		ExcludeDirs: []string{"dist"},
 	})
 	if err != nil {
@@ -37,15 +37,16 @@ func loadTestSite(t *testing.T, files map[string]string) *Site {
 	return site
 }
 
-// testSiteFiles 是测试用的站点骨架，覆盖页面、局部模板、被忽略目录与静态资源。
+// testSiteFiles 是测试用的站点骨架，覆盖页面、局部模板、数据文件、被忽略目录与静态资源。
 func testSiteFiles() map[string]string {
 	return map[string]string{
 		"index.html":              "<html>INDEX</html>",
 		"about.html":              `<html>{{template "header" .}}<main>ABOUT</main></html>`,
 		"help/index.html":         "<html>HELP-INDEX</html>",
 		"help/74.html":            "<html>HELP-74</html>",
-		"template/header.html":    `{{define "header"}}<header>SITE-HEADER</header>{{end}}`,
-		"template/note.txt":       "只有 html 参与模板解析",
+		"templates/header.html":   `{{define "header"}}<header>SITE-HEADER {{.site.title}}</header>{{end}}`,
+		"templates/data.json":     `{"site":{"title":"GOWEB-SITE"},"year":2026}`,
+		"templates/note.txt":      "只有 html 参与模板解析，data.json 参与数据加载",
 		"node_modules/pkg/a.html": "<html>DEP</html>",
 		".hidden/secret.html":     "<html>SECRET</html>",
 		"dist/old.html":           "<html>STALE</html>",
@@ -70,10 +71,10 @@ func TestLoadSitePages(t *testing.T) {
 	}
 
 	// 局部模板不产出页面，但仍注册在共享命名空间里。
-	if site.hasPage("template/header") {
+	if site.hasPage("templates/header") {
 		t.Fatal("局部模板不应出现在页面清单里")
 	}
-	if _, err := site.Render("template/header"); err != nil {
+	if _, err := site.Render("templates/header"); err != nil {
 		t.Fatalf("局部模板应可渲染: %v", err)
 	}
 }
@@ -103,8 +104,10 @@ func TestResolve(t *testing.T) {
 		{path: "//about//", wantKind: RouteRedirect, wantTarget: "/about/"},
 		{path: "/static/css/a.css", wantKind: RouteFile},
 		{path: "/robots.txt", wantKind: RouteFile},
-		{path: "/template/header.html", wantKind: RouteNotFound},
-		{path: "/template/header", wantKind: RouteNotFound},
+		{path: "/templates/header.html", wantKind: RouteNotFound},
+		{path: "/templates/header", wantKind: RouteNotFound},
+		{path: "/templates/data.json", wantKind: RouteNotFound},
+		{path: "/templates/note.txt", wantKind: RouteNotFound},
 		{path: "/static/", wantKind: RouteNotFound},
 		{path: "/missing", wantKind: RouteNotFound},
 		{path: "/missing/", wantKind: RouteNotFound},
@@ -162,12 +165,86 @@ func TestRenderInlinesPartial(t *testing.T) {
 	if !strings.Contains(html, "ABOUT") {
 		t.Fatalf("页面正文丢失: %s", html)
 	}
+	// data.json 对局部模板同样可用。
+	if !strings.Contains(html, "GOWEB-SITE") {
+		t.Fatalf("局部模板未拿到模板数据: %s", html)
+	}
 }
 
 func TestRenderUnknownTemplate(t *testing.T) {
 	site := loadTestSite(t, testSiteFiles())
 	if _, err := site.Render("nope"); err == nil {
 		t.Fatal("渲染不存在的模板应当报错")
+	}
+}
+
+// TestRenderWithDataJSON 覆盖模板数据的取值方式：嵌套对象、数字与 range 循环。
+func TestRenderWithDataJSON(t *testing.T) {
+	site := loadTestSite(t, map[string]string{
+		"index.html": `<p>{{.site.title}}|{{.year}}|{{range .items}}{{.name}},{{end}}|{{.missing}}</p>`,
+		"templates/data.json": `{
+			"site": {"title": "我的站点"},
+			"year": 2026,
+			"items": [{"name": "a"}, {"name": "b"}]
+		}`,
+	})
+
+	body, err := site.Render("index")
+	if err != nil {
+		t.Fatalf("渲染 index: %v", err)
+	}
+	want := "<p>我的站点|2026|a,b,|</p>"
+	if string(body) != want {
+		t.Fatalf("渲染结果 = %q，期望 %q", body, want)
+	}
+}
+
+// TestDataFileMissingMeansNoData 覆盖没有 data.json 的站点：不报错，缺值渲染为空。
+func TestDataFileMissingMeansNoData(t *testing.T) {
+	site := loadTestSite(t, map[string]string{"index.html": `<p>[{{.site.title}}]</p>`})
+
+	body, err := site.Render("index")
+	if err != nil {
+		t.Fatalf("渲染 index: %v", err)
+	}
+	if string(body) != "<p>[]</p>" {
+		t.Fatalf("渲染结果 = %q，期望 %q", body, "<p>[]</p>")
+	}
+}
+
+// TestDataFileInvalid 覆盖数据文件本身出错：JSON 语法错误或顶层不是对象都必须报错。
+func TestDataFileInvalid(t *testing.T) {
+	tests := map[string]string{
+		"JSON 语法错误": `{"site": }`,
+		"顶层不是对象":    `[1, 2, 3]`,
+		"顶层是字符串":    `"just a string"`,
+	}
+	for name, data := range tests {
+		t.Run(name, func(t *testing.T) {
+			dir := writeSite(t, map[string]string{
+				"index.html":          "<html>INDEX</html>",
+				"templates/data.json": data,
+			})
+			if _, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates"}); err == nil {
+				t.Fatalf("数据文件 %s 应当让加载失败", data)
+			}
+		})
+	}
+}
+
+// TestDataFileWithoutTemplateDir 覆盖未配置模板目录时没有数据来源。
+func TestDataFileWithoutTemplateDir(t *testing.T) {
+	site := loadTestSite(t, testSiteFiles())
+	if site.DataFile() == "" {
+		t.Fatal("配置了模板目录时数据文件路径不应为空")
+	}
+
+	plain, err := LoadSite(SiteOptions{Dir: writeSite(t, map[string]string{"index.html": "<html>INDEX</html>"})})
+	if err != nil {
+		t.Fatalf("LoadSite: %v", err)
+	}
+	if plain.DataFile() != "" {
+		t.Fatalf("未配置模板目录时数据文件路径应为空，实际 %q", plain.DataFile())
 	}
 }
 
@@ -191,7 +268,7 @@ func TestTemplateFuncs(t *testing.T) {
 
 func TestReloadKeepsPreviousTemplatesOnError(t *testing.T) {
 	dir := writeSite(t, map[string]string{"about.html": "<html>OLD</html>"})
-	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "template"})
+	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates"})
 	if err != nil {
 		t.Fatalf("LoadSite: %v", err)
 	}

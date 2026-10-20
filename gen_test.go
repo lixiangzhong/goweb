@@ -11,7 +11,7 @@ import (
 func generateTestSite(t *testing.T, files map[string]string, clean bool) (string, *Site, GenResult) {
 	t.Helper()
 	dir := writeSite(t, files)
-	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "template", ExcludeDirs: []string{"dist"}})
+	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates", ExcludeDirs: []string{"dist"}})
 	if err != nil {
 		t.Fatalf("LoadSite: %v", err)
 	}
@@ -44,8 +44,9 @@ func TestGenerateOutputTree(t *testing.T) {
 	// 页面源文件、局部模板、被忽略目录都不应进入产物。
 	unwanted := []string{
 		"about.html",
-		"template/header.html",
-		"template/note.txt",
+		"templates/header.html",
+		"templates/data.json",
+		"templates/note.txt",
 		"node_modules/pkg/a.html",
 		".hidden/secret.html",
 		"dist/old.html",
@@ -70,11 +71,15 @@ func TestGenerateOutputTree(t *testing.T) {
 	if !strings.Contains(string(body), "SITE-HEADER") || !strings.Contains(string(body), "ABOUT") {
 		t.Fatalf("产物页面内容不正确: %s", body)
 	}
+	// 模板数据在产物里同样生效，且 data.json 本身不进入产物。
+	if !strings.Contains(string(body), "GOWEB-SITE") {
+		t.Fatalf("产物页面缺少模板数据: %s", body)
+	}
 }
 
 func TestGenerateCleanBehavior(t *testing.T) {
 	dir := writeSite(t, map[string]string{"index.html": "<html>INDEX</html>"})
-	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "template", ExcludeDirs: []string{"dist"}})
+	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates", ExcludeDirs: []string{"dist"}})
 	if err != nil {
 		t.Fatalf("LoadSite: %v", err)
 	}
@@ -106,10 +111,10 @@ func TestGenerateCleanBehavior(t *testing.T) {
 // TestGenerateGuardsOutDir 确保危险产物目录在任何删除动作之前就被拦截。
 func TestGenerateGuardsOutDir(t *testing.T) {
 	dir := writeSite(t, map[string]string{
-		"index.html":           "<html>INDEX</html>",
-		"template/header.html": `{{define "header"}}<header>SITE-HEADER</header>{{end}}`,
+		"index.html":            "<html>INDEX</html>",
+		"templates/header.html": `{{define "header"}}<header>SITE-HEADER</header>{{end}}`,
 	})
-	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "template"})
+	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates"})
 	if err != nil {
 		t.Fatalf("LoadSite: %v", err)
 	}
@@ -117,7 +122,7 @@ func TestGenerateGuardsOutDir(t *testing.T) {
 	guarded := []string{
 		site.Root(),
 		filepath.Dir(site.Root()),
-		filepath.Join(site.Root(), "template"),
+		filepath.Join(site.Root(), "templates"),
 	}
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		guarded = append(guarded, home)
@@ -133,19 +138,19 @@ func TestGenerateGuardsOutDir(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(site.Root(), "index.html")); err != nil {
 		t.Fatalf("页面源文件被破坏: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(site.Root(), "template")); err != nil {
+	if _, err := os.Stat(filepath.Join(site.Root(), "templates")); err != nil {
 		t.Fatalf("局部模板目录被破坏: %v", err)
 	}
 }
 
 // TestGenerateFailsFastOnBrokenPage 覆盖渲染期报错：必须整体失败，不产出半成品页面。
-// 站点没有数据源，页面里的 {{.Field}} 就是典型的渲染期错误。
+// 引用一个不存在的模板名就是典型的渲染期错误（缺键只会渲染成空，不算错误）。
 func TestGenerateFailsFastOnBrokenPage(t *testing.T) {
 	dir := writeSite(t, map[string]string{
 		"index.html": "<html>INDEX</html>",
-		"bad.html":   "<html>{{.Field}}</html>",
+		"bad.html":   `<html>{{template "missing" .}}</html>`,
 	})
-	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "template", ExcludeDirs: []string{"dist"}})
+	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates", ExcludeDirs: []string{"dist"}})
 	if err != nil {
 		t.Fatalf("LoadSite: %v", err)
 	}

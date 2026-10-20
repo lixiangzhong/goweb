@@ -16,8 +16,8 @@ const (
 	defaultAddr = ":8080"
 	// defaultPageDir 是默认页面目录，即运行目录。
 	defaultPageDir = "."
-	// defaultTemplateDir 是默认局部模板目录，相对页面目录。
-	defaultTemplateDir = "template"
+	// defaultTemplateDir 是默认局部模板目录（同时是 data.json 所在目录），相对页面目录。
+	defaultTemplateDir = "templates"
 	// defaultOutDir 是 gen 的默认产物目录。
 	defaultOutDir = "dist"
 )
@@ -64,7 +64,7 @@ func run(args []string) error {
 	}
 }
 
-// runServe 启动开发服务器：目录式路由 + 模板渲染 + 静态文件直出，并在模板变更后重编译。
+// runServe 启动开发服务器：目录式路由 + 模板渲染 + 静态文件直出，模板或数据变更后自动重载。
 func runServe(args []string) error {
 	var opts serveOptions
 	flags := serveFlagSet(&opts, os.Stderr)
@@ -100,6 +100,7 @@ func runServe(args []string) error {
 		"addr", opts.addr,
 		"dir", site.Root(),
 		"pages", len(site.Pages()),
+		"data", site.DataFile(),
 	)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -136,6 +137,7 @@ func runGen(args []string) error {
 		"out", result.Out,
 		"pages", result.Pages,
 		"assets", result.Assets,
+		"data", site.DataFile(),
 	)
 	return nil
 }
@@ -196,13 +198,18 @@ const usageText = `goweb —— 面向前端开发的静态站服务器与静态
     index.html    -> /
     about.html    -> /about/
     help/74.html  -> /help/74/
-  局部模板目录（-template，默认 template）里的 html 只参与模板解析，
+  局部模板目录（-template，默认 templates）里的 html 只参与模板解析，
   不产出页面、也不能被直接访问。
 
 模板写法：
   页面与局部模板共用同一个 html/template 命名空间：
-    局部模板 template/header.html：{{define "header"}}...{{end}}
+    局部模板 templates/header.html：{{define "header"}}...{{end}}
     页面 about.html：{{template "header" .}}
+  模板数据来自 templates/data.json 的顶层对象，页面与局部模板共用：
+    data.json：{"site":{"title":"我的站点"},"year":2026}
+    模板里：{{.site.title}} / {{.year}}
+  数据文件缺失表示没有数据；JSON 语法错误或顶层不是对象会直接报错；
+  缺键按 Go 模板原生语义渲染成空字符串（写错键名只会留白，不会报错）。
   内置模板函数：
     {{"<b>x</b>"|HTML}}   原样输出为 HTML
     {{JS "x"}}            编码为 JSON 字面量
@@ -212,5 +219,6 @@ URL 规则（与 gen 产物布局严格一致）：
   /、/about/、/help/74/ 是唯一 URL；/about、/about.html、/index.html
   一律 301 到目录 URL；未命中页面时按磁盘真实文件直出；
   其余返回纯文本 404（无自定义 404 约定、无目录列表）。
-  模板变更后自动重编译，但不注入热刷新脚本，需要手动刷新浏览器。
+  模板目录整体不可直接访问（含 data.json）。
+  模板或数据变更后自动重载，但不注入热刷新脚本，需要手动刷新浏览器。
 `

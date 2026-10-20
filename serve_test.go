@@ -37,7 +37,9 @@ func TestHandlerRoutes(t *testing.T) {
 		{name: "目录无 index 回退页面", method: http.MethodGet, path: "/help/74/", wantStatus: http.StatusOK, wantContains: "HELP-74"},
 		{name: "静态文件直出", method: http.MethodGet, path: "/static/css/a.css", wantStatus: http.StatusOK, wantContains: "body{color:red}"},
 		{name: "根目录静态文件直出", method: http.MethodGet, path: "/robots.txt", wantStatus: http.StatusOK, wantContains: "User-agent"},
-		{name: "局部模板不可访问", method: http.MethodGet, path: "/template/header.html", wantStatus: http.StatusNotFound},
+		{name: "局部模板不可访问", method: http.MethodGet, path: "/templates/header.html", wantStatus: http.StatusNotFound},
+		{name: "模板目录的数据文件不可访问", method: http.MethodGet, path: "/templates/data.json", wantStatus: http.StatusNotFound},
+		{name: "模板目录的普通文件不可访问", method: http.MethodGet, path: "/templates/note.txt", wantStatus: http.StatusNotFound},
 		{name: "未知路径 404", method: http.MethodGet, path: "/missing", wantStatus: http.StatusNotFound},
 		{name: "未知目录 404", method: http.MethodGet, path: "/missing/", wantStatus: http.StatusNotFound},
 		{name: "非 GET/HEAD 方法拒绝", method: http.MethodPost, path: "/about/", wantStatus: http.StatusMethodNotAllowed},
@@ -78,10 +80,13 @@ func TestHandlerStaticFileContentType(t *testing.T) {
 	}
 }
 
-// TestWatchReloadsTemplates 覆盖真实的文件监听链路：改动页面后应自动重编译。
+// TestWatchReloadsTemplates 覆盖真实的文件监听链路：改动页面与 data.json 后应自动重编译。
 func TestWatchReloadsTemplates(t *testing.T) {
-	dir := writeSite(t, map[string]string{"about.html": "<html>OLD</html>"})
-	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "template"})
+	dir := writeSite(t, map[string]string{
+		"about.html":          "<html>OLD {{.title}}</html>",
+		"templates/data.json": `{"title":"T1"}`,
+	})
+	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates"})
 	if err != nil {
 		t.Fatalf("LoadSite: %v", err)
 	}
@@ -92,18 +97,32 @@ func TestWatchReloadsTemplates(t *testing.T) {
 	}
 	defer stop()
 
-	if err := os.WriteFile(filepath.Join(dir, "about.html"), []byte("<html>NEW</html>"), 0o644); err != nil {
+	// 改模板本身。
+	if err := os.WriteFile(filepath.Join(dir, "about.html"), []byte("<html>NEW {{.title}}</html>"), 0o644); err != nil {
 		t.Fatalf("写入新模板: %v", err)
 	}
+	waitForRender(t, site, "about", "NEW")
 
+	// 改数据文件。
+	if err := os.WriteFile(filepath.Join(dir, "templates", "data.json"), []byte(`{"title":"T2"}`), 0o644); err != nil {
+		t.Fatalf("写入新数据: %v", err)
+	}
+	waitForRender(t, site, "about", "T2")
+}
+
+// waitForRender 轮询等待某个模板渲染出期望内容，超时即失败。
+func waitForRender(t *testing.T, site *Site, name, want string) {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
+	var last []byte
 	for {
-		body, err := site.Render("about")
-		if err == nil && strings.Contains(string(body), "NEW") {
+		body, err := site.Render(name)
+		last = body
+		if err == nil && strings.Contains(string(body), want) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("模板未在 5s 内重编译，最后内容: %s", body)
+			t.Fatalf("模板 %s 未在 5s 内渲染出 %q，最后内容: %s", name, want, last)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
