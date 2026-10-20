@@ -26,9 +26,10 @@ goweb gen            # 产出 dist/
 ├── help/
 │   ├── index.html          -> /help/
 │   └── 74.html             -> /help/74/
-├── template/               局部模板目录，不产出页面
+├── templates/              局部模板目录，不产出页面
 │   ├── header.html
-│   └── footer.html
+│   ├── footer.html
+│   └── data.json           模板数据，页面与局部模板共用
 └── static/                 资源目录，原样拷贝进产物
     ├── css/site.css
     └── js/site.js
@@ -37,8 +38,8 @@ goweb gen            # 产出 dist/
 ## 命令与参数
 
 ```bash
-goweb [serve] [-addr :8080] [-dir .] [-template template]
-goweb gen     [-dir .] [-template template] [-out dist] [-clean=true]
+goweb [serve] [-addr :8080] [-dir .] [-template templates]
+goweb gen     [-dir .] [-template templates] [-out dist] [-clean=true]
 goweb help
 ```
 
@@ -46,7 +47,7 @@ goweb help
 | --- | --- | --- | --- |
 | `-addr` | serve | `:8080` | 监听地址 |
 | `-dir` | 全部 | `.` | 页面目录 |
-| `-template` | 全部 | `template` | 局部模板目录（相对页面目录），置空表示没有 |
+| `-template` | 全部 | `templates` | 局部模板目录（相对页面目录），数据文件也在其中；置空表示没有 |
 | `-out` | gen | `dist` | 产物目录 |
 | `-clean` | gen | `true` | 生成前清空产物目录 |
 
@@ -55,7 +56,7 @@ goweb help
 所有页面与局部模板解析进同一个 `html/template` 命名空间，因此局部模板里 `define` 的名字可以被任意页面引用：
 
 ```html
-<!-- template/header.html -->
+<!-- templates/header.html -->
 {{define "header"}}
 <header class="site-header"><a href="/">首页</a></header>
 {{end}}
@@ -73,6 +74,30 @@ goweb help
 </html>
 ```
 
+### 模板数据：templates/data.json
+
+`templates/data.json` 的顶层对象就是模板的渲染数据，页面与局部模板共用同一份（`{{template "header" .}}` 里也能直接取）：
+
+```json
+{
+  "site": { "title": "我的站点", "beian": "京ICP备xxxx号" },
+  "year": 2026,
+  "nav": [{ "name": "首页", "url": "/" }, { "name": "关于", "url": "/about/" }]
+}
+```
+
+```html
+<title>{{.site.title}}</title>
+{{range .nav}}<a href="{{.url}}">{{.name}}</a>{{end}}
+<footer>© {{.year}} {{.site.beian}}</footer>
+```
+
+- 文件不存在表示没有数据，不报错。
+- JSON 语法错误、或顶层不是对象（数组/字符串等）会直接报错：serve 启动失败、gen 退出码非零。
+- 数据文件参与热重编译：改 `data.json` 后刷新页面即可看到新数据。
+- **缺键不报错**：数据里没有的键（例如把 `site.title` 写成 `site.titl`）按 Go 模板原生语义渲染成空字符串，只会静默留白，需要自行核对键名。
+- `data.json` 只是模板数据源，不会进产物目录。
+
 内置模板函数只有两个：
 
 ```html
@@ -80,7 +105,7 @@ goweb help
 <script>const cfg = {{JS "hello"}};</script>   <!-- 值编码为 JSON 字面量 -->
 ```
 
-**没有数据源**：页面不接收任何变量（没有 JSON、没有 front-matter）。页面里误写 `{{.Title}}` 会直接报错（serve 返回 500、gen 直接失败），而不是静默渲染成空字符串。
+单页专属数据（例如每页不同的 title）不在设计范围内：`data.json` 是站点级共享数据，页面差异直接写在各自的 html 里。
 
 ## URL 规则
 
@@ -93,7 +118,7 @@ goweb help
 | `/help/` | 先找 `help/index.html`，回退 `help.html` |
 | `/help/74/` | 渲染 `help/74.html` |
 | `/static/css/site.css` | 磁盘文件直出 |
-| `/template/header.html` | `404`：局部模板不可访问 |
+| `/templates/header.html` | `404`：局部模板不可访问 |
 | 其余 | 纯文本 `404`（无自定义 404 页面、不做目录列表） |
 
 页面 URL 一定以 `/` 结尾，和静态托管对 `<目录>/index.html` 的解析方式一致，因此本地预览不会出现「本地能跑、线上裂开」。
@@ -133,7 +158,7 @@ dist/
 | --- | --- | --- |
 | 依赖 | gin + unrolled/render | 标准库 + fsnotify |
 | 模板函数 | i18n、DB 查询等一大堆 | 只有 `HTML`、`JS` |
-| 渲染数据 | `c.Keys`（中间件注入的运行时数据） | 无数据源 |
+| 渲染数据 | `c.Keys`（中间件注入的运行时数据） | `templates/data.json`（站点级静态数据） |
 | URL 语义 | 带扩展名与不带扩展名都能直接 200 | 目录式严格一致，非目录 URL 一律 301 |
 | 多语言 | `lang/` 前缀模板 + locales JSON | 不做 |
 | 错误页 | `404` 模板 | 纯文本 404 |
@@ -141,4 +166,4 @@ dist/
 
 ## 目前不做
 
-浏览器热刷新（SSE 注入）、CSS 热替换、自定义 404 页面、多语言、资源内容哈希、数据源/JSON 注入。模板变更后自动重编译，浏览器手动刷新即可。
+浏览器热刷新（SSE 注入）、CSS 热替换、自定义 404 页面、多语言、资源内容哈希、每页独立数据（`data.json` 是站点级共享数据）。模板与 `data.json` 变更后自动重编译，浏览器手动刷新即可。
