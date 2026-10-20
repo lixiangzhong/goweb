@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -38,7 +39,11 @@ var e2eAddrRe = regexp.MustCompile(`addr=([0-9.]+:[0-9]+)`)
 // buildGoweb 编译出真实二进制，供 e2e 像用户一样调用。
 func buildGoweb(t *testing.T) string {
 	t.Helper()
-	binary := filepath.Join(t.TempDir(), "goweb")
+	name := "goweb"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	binary := filepath.Join(t.TempDir(), name)
 	cmd := exec.Command("go", "build", "-o", binary, ".")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("编译 goweb 失败: %v\n%s", err, out)

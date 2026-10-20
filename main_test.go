@@ -338,7 +338,9 @@ func TestServeFailsOnInvalidAddr(t *testing.T) {
 	if err == nil {
 		t.Fatal("非法监听地址应当报错")
 	}
-	if !strings.Contains(err.Error(), "invalid port") {
+	// 不同平台与 Go 版本的措辞可能不同，这里只要求错误确实指向地址/端口。
+	message := err.Error()
+	if !strings.Contains(message, "port") && !strings.Contains(message, "address") {
 		t.Fatalf("错误信息不像监听失败: %v", err)
 	}
 }
