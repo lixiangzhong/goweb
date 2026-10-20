@@ -1,0 +1,12 @@
+# 构建产物
+/goweb
+/dist/
+
+# 测试与调试产物
+*.test
+*.out
+
+# 编辑器与系统文件
+.DS_Store
+.idea/
+.vscode/
