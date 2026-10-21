@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -120,21 +119,24 @@ func newServeCommand(globals *globalOptions) *cobra.Command {
 func newGenCommand(globals *globalOptions) *cobra.Command {
 	var out string
 	var clean bool
+	var minifyOutput bool
 
 	cmd := &cobra.Command{
 		Use:     "gen",
 		Aliases: []string{"build"},
 		Short:   "渲染模板并产出纯静态站（别名：build）",
-		Long:    "渲染模板并产出纯静态站：页面按页面根落盘（pages/about.html -> dist/about.html），其余文件按所属根原样拷贝；生成前清空产物目录，任一页面渲染失败即整体失败。别名 build 与 gen 完全等价。",
+		Long:    "渲染模板并产出纯静态站：页面按页面根落盘（pages/about.html -> dist/about.html），其余文件按所属根拷贝；生成前清空产物目录，任一页面渲染失败即整体失败。默认压缩页面与 CSS/JS/JSON/SVG/XML 资源（只去空白与注释，不改 JS 变量名），用 --minify=false 关闭。别名 build 与 gen 完全等价。",
 		Example: genExample,
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cmd.SilenceUsage = true
-			return runGen(cmd, genOptions{globals: globals, out: out, clean: clean})
+			return runGen(cmd, genOptions{globals: globals, out: out, clean: clean, minify: minifyOutput})
 		},
 	}
 	cmd.Flags().StringVarP(&out, "out", "o", defaultOutDir, "产物目录")
 	cmd.Flags().BoolVarP(&clean, "clean", "c", true, "生成前清空产物目录")
+	cmd.Flags().BoolVar(&minifyOutput, "minify", true,
+		"压缩页面与 CSS/JS/JSON/SVG/XML 资源（只去空白与注释，不改 JS 变量名）；--minify=false 关闭")
 	return cmd
 }
 
@@ -214,6 +216,7 @@ type genOptions struct {
 	globals *globalOptions
 	out     string
 	clean   bool
+	minify  bool
 }
 
 // runServe 启动开发服务器。
@@ -251,7 +254,8 @@ func runServe(cmd *cobra.Command, opts serveOptions) error {
 
 	// 先监听再打印日志：--addr 写 :0 时日志给出的是内核分配的真实地址，
 	// 脚本与端到端测试可以直接读它。
-	listener, err := net.Listen("tcp", resolved.addr)
+	// 没有显式指定端口（用的内置默认 :8080）时，端口被占用会自动递增重试。
+	listener, err := listenWithFallback(resolved.addr, !resolved.addrExplicit, logger)
 	if err != nil {
 		return err
 	}
@@ -292,7 +296,7 @@ func runServe(cmd *cobra.Command, opts serveOptions) error {
 func runGen(cmd *cobra.Command, opts genOptions) error {
 	logger := newLogger(cmd.ErrOrStderr())
 
-	resolved, err := resolveSettings(cmd, opts.globals, localFlags{out: opts.out}, false)
+	resolved, err := resolveSettings(cmd, opts.globals, localFlags{out: opts.out, minify: opts.minify}, false)
 	if err != nil {
 		return err
 	}
@@ -306,7 +310,9 @@ func runGen(cmd *cobra.Command, opts genOptions) error {
 		return err
 	}
 
-	result, err := Generate(site, GenOptions{Out: out, Clean: opts.clean, Logger: logger})
+	result, err := Generate(site, GenOptions{
+		Out: out, Clean: opts.clean, Minify: resolved.minify, Logger: logger,
+	})
 	if err != nil {
 		return err
 	}
@@ -337,6 +343,10 @@ const rootLongDescription = `goweb 用两个子命令覆盖「本地写页面 �
 
 不带子命令时等价于 serve，直接在当前目录起开发服务器。
 
+监听端口（--addr，默认 :8080）：
+  没有显式指定端口时，8080 被占用会自动依次尝试 8081…8089，并在日志里说明；
+  显式写 --addr 或在配置里写 addr 就表示「我就要这个端口」，被占用时直接报错退出。
+
 浏览器热重载（--livereload，默认开启）：
   serve 会在 html 响应末尾注入一段脚本，通过 SSE 端点 ` + liveReloadPath + ` 接收刷新信号；
   改页面、模板、data.json 或静态资源都会整页刷新。这是 serve 独有的注入，
@@ -355,8 +365,15 @@ const rootLongDescription = `goweb 用两个子命令覆盖「本地写页面 �
   gen 时页面按页面根落盘、资源按所属根落盘，URL 与产物路径始终一致。
 
 配置文件 .goweb.yml（可选，放在项目根；用 --config 指定其它位置）：
-  dir / template / assets / out / mode / build-time / fingerprint / livereload / addr /
-  gitignore / ignore —— 键名与 flag 同名，优先级 flag > 配置 > 默认，未知字段直接报错。
+  dir / template / assets / out / minify / mode / build-time / fingerprint / livereload /
+  addr / open / gitignore / ignore —— 键名与 flag 同名，优先级 flag > 配置 > 默认，
+  未知字段直接报错。
+
+产物压缩（--minify，默认开启；只作用于 gen/build）：
+  压缩页面与 CSS/JS/JSON/SVG/XML 资源，只去空白与注释：不改 JS 变量名（minify 不是 uglify），
+  <pre>/<textarea> 内的空白逐字节保留，CSS/JS 里的 /*! 许可声明 */ 保留；serve 始终不压缩。
+  注意模板里的 HTML 注释本来就会被 html/template 丢掉；可选闭合标签与属性引号会被省略，
+  依赖正则处理 HTML 的下游工具请用 --minify=false。
 
 忽略规则（项目根的 .gitignore + 配置里的 ignore）**只作用于 gen**：
   被忽略的文件不进产物，但 serve 仍能看到，方便本地预览草稿。

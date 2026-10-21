@@ -34,6 +34,7 @@ type fileConfig struct {
 	LiveReload  *bool    `yaml:"livereload"`
 	Addr        *string  `yaml:"addr"`
 	Open        *bool    `yaml:"open"`
+	Minify      *bool    `yaml:"minify"`
 	Gitignore   *bool    `yaml:"gitignore"`
 	Ignore      []string `yaml:"ignore"`
 }
@@ -167,7 +168,11 @@ type settings struct {
 	fingerprint  bool
 	liveReload   bool
 	open         bool
+	minify       bool
 	addr         string
+	// addrExplicit 表示 addr 来自 --addr 或配置（而不是内置默认值）：
+	// 只有非显式指定时才允许端口被占用后自动递增。
+	addrExplicit bool
 	ignore       []string
 	useGitignore bool
 }
@@ -178,6 +183,7 @@ type localFlags struct {
 	liveReload bool
 	open       bool
 	out        string
+	minify     bool
 }
 
 // resolveSettings 合并命令行 flag 与 .goweb.yml，得到最终设置。
@@ -200,6 +206,7 @@ func resolveSettings(cmd *cobra.Command, globals *globalOptions, local localFlag
 		templateRoot: pickString(globals.templateDir, changed("template"), config.Template, defaultTemplateDir),
 		assetsRoot:   pickString(globals.assetsRoot, changed("assets"), config.Assets, defaultAssetsRoot),
 		out:          pickString(local.out, changed("out"), config.Out, defaultOutDir),
+		minify:       pickBool(local.minify, changed("minify"), config.Minify, true),
 		fingerprint:  pickBool(globals.fingerprint, changed("fingerprint"), config.Fingerprint, true),
 		liveReload:   pickBool(local.liveReload, changed("livereload"), config.LiveReload, true),
 		open:         pickBool(local.open, changed("open"), config.Open, true),
@@ -207,6 +214,9 @@ func resolveSettings(cmd *cobra.Command, globals *globalOptions, local localFlag
 		useGitignore: pickBool(false, false, config.Gitignore, true),
 		ignore:       config.Ignore,
 	}
+
+	// 「显式指定端口」= 命令行给了 --addr，或配置文件里写了 addr。
+	resolved.addrExplicit = changed("addr") || config.Addr != nil
 
 	rawMode := pickString(globals.mode, changed("mode"), config.Mode, modeAuto)
 	if resolved.mode, err = resolveMode(rawMode, devCommand); err != nil {

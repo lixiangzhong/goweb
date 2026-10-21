@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/tdewolff/minify/v2"
 )
 
 // GenOptions 描述静态产物的输出位置与清理策略。
@@ -17,6 +19,8 @@ type GenOptions struct {
 	Out string
 	// Clean 表示生成前清空产物目录。
 	Clean bool
+	// Minify 表示压缩页面与可压缩的资源（HTML/CSS/JS/JSON/SVG/XML）；其余文件逐字节拷贝。
+	Minify bool
 	// Logger 用于记录跳过项；为空时静默。
 	Logger *slog.Logger
 }
@@ -30,9 +34,16 @@ type GenResult struct {
 }
 
 // Generate 把站点渲染为纯静态产物：页面按目录式落盘，其余文件原样拷贝。
+// 开启 Minify 时页面与可压缩资源会被压缩（只去空白与注释，不改 JS 变量名）。
 // 任一步失败即整体失败，不做静默跳过，避免半成品产物被当成成功发布。
 func Generate(site *Site, opts GenOptions) (GenResult, error) {
 	var result GenResult
+
+	// 压缩器按需构造一次：关闭压缩时为 nil，代码路径只有「原样拷贝」。
+	var minifier *minify.M
+	if opts.Minify {
+		minifier = newMinifier()
+	}
 
 	out, err := filepath.Abs(opts.Out)
 	if err != nil {
@@ -68,6 +79,12 @@ func Generate(site *Site, opts GenOptions) (GenResult, error) {
 		if err != nil {
 			return result, fmt.Errorf("渲染页面 %s: %w", name, err)
 		}
+		// 压缩在渲染与资源版本号改写之后进行：先保证 URL 已经定稿，再去空白与注释。
+		if minifier != nil {
+			if body, err = minifyBytes(minifier, mediaTypeHTML, body); err != nil {
+				return result, fmt.Errorf("压缩页面 %s: %w", name, err)
+			}
+		}
 		// 页面产物跟随页面根：about.html -> dist/about.html。
 		rel := filepath.FromSlash(name + pageExt)
 		target := filepath.Join(out, rel)
@@ -83,7 +100,7 @@ func Generate(site *Site, opts GenOptions) (GenResult, error) {
 		result.Pages++
 	}
 
-	assets, err := copyAssets(site, out, artifacts, logger)
+	assets, err := copyAssets(site, out, artifacts, minifier, logger)
 	if err != nil {
 		return result, err
 	}
@@ -174,7 +191,8 @@ func cleanDir(dir string) error {
 // 产物路径按「所属根」决定：位于页面根内的文件按页面根相对路径
 // （这样页面里的相对引用才对得上），其余按资源根相对路径。
 // 被忽略规则排除的文件不进产物，并记录日志。
-func copyAssets(site *Site, out string, artifacts map[string]string, logger *slog.Logger) (int, error) {
+// minifier 非空时，按扩展名可压缩的文件（CSS/JS/JSON/SVG/XML）会压缩后写出。
+func copyAssets(site *Site, out string, artifacts map[string]string, minifier *minify.M, logger *slog.Logger) (int, error) {
 	assetsRoot := site.AssetsRoot()
 	outInAssets := withinDir(assetsRoot, out) || out == assetsRoot
 	count := 0
@@ -247,7 +265,7 @@ func copyAssets(site *Site, out string, artifacts map[string]string, logger *slo
 		if err := recordArtifact(artifacts, rel, filePath); err != nil {
 			return err
 		}
-		if err := copyFile(filePath, filepath.Join(out, rel)); err != nil {
+		if err := copyFile(filePath, filepath.Join(out, rel), minifier, minifyMediaType(filePath)); err != nil {
 			return err
 		}
 		count++
@@ -273,7 +291,8 @@ func symlinkToDir(filePath string) (bool, error) {
 }
 
 // copyFile 拷贝单个文件到目标路径。
-func copyFile(src, dst string) error {
+// minifier 非空且 mediaType 非空时改为「流式压缩写入」，其余情况逐字节原样拷贝。
+func copyFile(src, dst string, minifier *minify.M, mediaType string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("打开 %s: %w", src, err)
@@ -287,10 +306,17 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("创建 %s: %w", dst, err)
 	}
-	if _, err := io.Copy(out, in); err != nil {
+
+	if minifier != nil && mediaType != "" {
+		if err := minifier.Minify(mediaType, out, in); err != nil {
+			out.Close()
+			return fmt.Errorf("压缩 %s: %w", src, err)
+		}
+	} else if _, err := io.Copy(out, in); err != nil {
 		out.Close()
 		return fmt.Errorf("写入 %s: %w", dst, err)
 	}
+
 	if err := out.Close(); err != nil {
 		return fmt.Errorf("关闭 %s: %w", dst, err)
 	}

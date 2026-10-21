@@ -145,9 +145,44 @@ type siteWatcher struct {
 	watcher *fsnotify.Watcher
 	// onReload 在每次成功重载后调用，用于通知浏览器刷新；可为 nil。
 	onReload func()
+	// selfOutputs 是本进程日志输出指向的文件；它们的变更是自己写出来的，
+	// 必须忽略，否则每行日志都会触发重载、重载又写日志，形成自触发死循环。
+	selfOutputs []os.FileInfo
 
 	mu    sync.Mutex
 	timer *time.Timer
+}
+
+// selfOutputFiles 返回本进程 stdout/stderr 指向的常规文件。
+// 典型场景是 `goweb serve > site/build.log`：日志文件落在站点里时会被监听到。
+// 终端（字符设备）与管道不会命中，因此正常用法不受影响。
+func selfOutputFiles() []os.FileInfo {
+	var files []os.FileInfo
+	for _, stream := range []*os.File{os.Stdout, os.Stderr} {
+		info, err := stream.Stat()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		files = append(files, info)
+	}
+	return files
+}
+
+// isSelfOutput 判断路径是否就是本进程的日志输出文件。
+func isSelfOutput(files []os.FileInfo, path string) bool {
+	if len(files) == 0 {
+		return false
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	for _, file := range files {
+		if os.SameFile(file, info) {
+			return true
+		}
+	}
+	return false
 }
 
 // watchSite 启动站点文件监听，返回停止监听的函数；onReload 可为 nil。
@@ -157,10 +192,11 @@ func watchSite(site *Site, logger *slog.Logger, onReload func()) (func(), error)
 		return nil, err
 	}
 	sw := &siteWatcher{
-		site:     site,
-		logger:   logger,
-		watcher:  watcher,
-		onReload: onReload,
+		site:        site,
+		logger:      logger,
+		watcher:     watcher,
+		onReload:    onReload,
+		selfOutputs: selfOutputFiles(),
 	}
 	if err := sw.addPaths(); err != nil {
 		watcher.Close()
@@ -178,7 +214,7 @@ func (w *siteWatcher) loop() {
 			if !ok {
 				return
 			}
-			if w.site.Ignored(event.Name) {
+			if w.site.Ignored(event.Name) || isSelfOutput(w.selfOutputs, event.Name) {
 				continue
 			}
 			w.schedule()
