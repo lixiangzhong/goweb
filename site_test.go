@@ -326,8 +326,8 @@ func TestIgnored(t *testing.T) {
 		filepath.Join(filepath.Dir(root), "other.html"): true,
 	}
 	for path, want := range tests {
-		if got := site.Ignored(path); got != want {
-			t.Fatalf("Ignored(%q) = %v，期望 %v", path, got, want)
+		if got := site.ignoredPath(path); got != want {
+			t.Fatalf("ignoredPath(%q) = %v，期望 %v", path, got, want)
 		}
 	}
 }
@@ -462,8 +462,8 @@ func TestWithinTemplateDir(t *testing.T) {
 		filepath.Join(root, "about.html"):                false,
 	}
 	for path, want := range tests {
-		if got := site.WithinTemplateDir(path); got != want {
-			t.Fatalf("WithinTemplateDir(%q) = %v，期望 %v", path, got, want)
+		if got := site.withinTemplateRoot(path); got != want {
+			t.Fatalf("withinTemplateRoot(%q) = %v，期望 %v", path, got, want)
 		}
 	}
 
@@ -472,7 +472,7 @@ func TestWithinTemplateDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSite: %v", err)
 	}
-	if plain.WithinTemplateDir(filepath.Join(root, "templates", "header.html")) {
+	if plain.withinTemplateRoot(filepath.Join(root, "templates", "header.html")) {
 		t.Fatal("没有模板目录时不应判定为模板文件")
 	}
 }
@@ -490,10 +490,8 @@ func TestRenderConcurrentWithReload(t *testing.T) {
 
 	done := make(chan struct{})
 	var wg sync.WaitGroup
-	for i := 0; i < 4; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 4 {
+		wg.Go(func() {
 			for {
 				select {
 				case <-done:
@@ -505,14 +503,65 @@ func TestRenderConcurrentWithReload(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		if err := site.Reload(); err != nil {
 			t.Fatalf("Reload: %v", err)
 		}
 	}
 	close(done)
 	wg.Wait()
+}
+
+// TestIgnoredPolicyIsConsistent 锁定「忽略策略只有一份」。
+//
+// 两个入口回答的是不同粒度的问题：
+//   - ignoredPath：单点判断（能否对外提供、要不要过滤事件），逐路径组件检查；
+//   - skipInWalk：walk 阶段判断，只看 basename——父目录一旦跳过会被 fs.SkipDir 剪枝，
+//     所以「被忽略目录里的文件」永远不会走到它面前。
+//
+// 因此契约是：**路径自身命中忽略规则时两者必须一致**（尤其是「名为 node_modules 的普通
+// 文件」这种以前会分叉的情况）；嵌套在被忽略目录内的路径允许不同，因为 walk 根本走不到。
+func TestIgnoredPolicyIsConsistent(t *testing.T) {
+	dir := writeSite(t, map[string]string{
+		"index.html":          "<html>INDEX</html>",
+		"node_modules":        "这是个普通文件，不是目录",
+		".hidden/secret.html": "<html>SECRET</html>",
+		"dist/stale.html":     "<html>STALE</html>",
+		"static/keep.css":     "body{}",
+	})
+	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates", ExcludeDirs: []string{"dist"}})
+	if err != nil {
+		t.Fatalf("LoadSite: %v", err)
+	}
+
+	// 路径自身命中：两者必须一致。
+	consistent := map[string]bool{
+		"node_modules":    true, // 同名普通文件：以前 skipPath 会放行，导致 gen 会拷、serve 拒服务
+		".hidden":         true, // 隐藏目录本身
+		"dist/stale.html": true, // 显式排除目录内的路径（按前缀判定，两个入口都能命中）
+		"static/keep.css": false,
+		"index.html":      false,
+	}
+	for rel, want := range consistent {
+		full := filepath.Join(dir, filepath.FromSlash(rel))
+		if got := site.ignoredPath(full); got != want {
+			t.Errorf("ignoredPath(%s) = %v，期望 %v", rel, got, want)
+		}
+		if got := site.skipInWalk(full); got != want {
+			t.Errorf("skipInWalk(%s) = %v，期望 %v（应与 ignoredPath 一致）", rel, got, want)
+		}
+	}
+
+	// 嵌套在被忽略目录内：ignoredPath 说忽略，skipInWalk 因为只看 basename 说不忽略，
+	// 但 walk 会在父目录处剪枝，所以这个差异不可达（记录在此，避免以后误判为 bug）。
+	nested := filepath.Join(dir, ".hidden", "secret.html")
+	if !site.ignoredPath(nested) {
+		t.Error("被忽略目录里的文件，单点判断应当忽略")
+	}
+	if site.skipInWalk(nested) {
+		t.Error("walk 判断只看 basename，不应命中父目录的忽略规则（依赖父目录剪枝）")
+	}
 }

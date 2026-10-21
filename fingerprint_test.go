@@ -262,3 +262,50 @@ func TestFingerprintRewrittenDocumentStillRenders(t *testing.T) {
 		}
 	}
 }
+
+// TestPageRootHTMLIsNotAnAsset 覆盖「页面根里的 html 不是可哈希资源」这条判定不能依赖
+// URL 里的页面名：
+//
+// dir 不是项目根时（例如 dir: pages），页面里若把链接写成 /pages/other.html，URL 会解析到
+// 真实的页面源文件；但它不会进产物（页面根 html 由渲染产出）。以前按页面名比对会漏判，
+// 于是给它加上 ?v=<哈希>，把必然 404 的坏链接伪装成正常资源链接。
+func TestPageRootHTMLIsNotAnAsset(t *testing.T) {
+	dir := writeSite(t, map[string]string{
+		"pages/index.html": `<html><body><a href="/pages/other.html">错链接</a><a href="/other.html">对链接</a></body></html>`,
+		"pages/other.html": `<html><body>OTHER</body></html>`,
+		"static/a.css":     "body{}",
+	})
+	site, err := LoadSite(SiteOptions{
+		ProjectRoot: dir, Dir: "pages", TemplateDir: "templates", AssetsRoot: ".",
+		Fingerprint: true,
+	})
+	if err != nil {
+		t.Fatalf("LoadSite: %v", err)
+	}
+
+	// 页面根里的 html 一律不是资源（带不带页面根目录名都一样）。
+	for _, urlPath := range []string{"/pages/other.html", "/other.html", "/pages/index.html"} {
+		if _, err := site.assetFile(urlPath); err == nil {
+			t.Errorf("assetFile(%s) 应当拒绝：页面根里的 html 是渲染产物", urlPath)
+		}
+	}
+	// 普通静态资源仍然可用。
+	if _, err := site.assetFile("/static/a.css"); err != nil {
+		t.Errorf("assetFile(/static/a.css) 应当成功: %v", err)
+	}
+
+	// 端到端地看渲染结果：错链接不该被加上 ?v=，对链接本来就不加。
+	body, err := site.Render("index")
+	if err != nil {
+		t.Fatalf("渲染: %v", err)
+	}
+	html := string(body)
+	if strings.Contains(html, "/pages/other.html?v=") {
+		t.Fatalf("指向页面源文件的错链接不应被加上内容哈希: %s", html)
+	}
+	for _, want := range []string{`href="/pages/other.html"`, `href="/other.html"`} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("链接应保持原样 %s: %s", want, html)
+		}
+	}
+}

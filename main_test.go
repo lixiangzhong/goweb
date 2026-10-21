@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -514,5 +515,67 @@ func TestModeAndBuildTimeFlags(t *testing.T) {
 	if _, _, err := executeCLI("gen", "--build-time", "昨天"); err == nil ||
 		!strings.Contains(err.Error(), "--build-time") {
 		t.Fatalf("非法 --build-time 应报参数错误，实际: %v", err)
+	}
+}
+
+// TestDevAliasEqualsServe 覆盖 serve 的别名 dev：CLI 结构上有别名，行为与 serve 一致。
+func TestDevAliasEqualsServe(t *testing.T) {
+	root := newRootCommand()
+	serveCommand := serveCmd(t, root)
+	if !equalStrings(serveCommand.Aliases, []string{"dev"}) {
+		t.Fatalf("serve 的别名 = %v，期望 [dev]", serveCommand.Aliases)
+	}
+	aliased, args, err := root.Find([]string{"dev", "--addr", ":3000"})
+	if err != nil {
+		t.Fatalf("解析 dev: %v", err)
+	}
+	if aliased != serveCommand {
+		t.Fatalf("dev 应解析到 serve 命令，实际 %s", aliased.Name())
+	}
+	if !equalStrings(args, []string{"--addr", ":3000"}) {
+		t.Fatalf("别名后的参数应原样保留，实际 %v", args)
+	}
+
+	t.Run("行为与 serve 一致", func(t *testing.T) {
+		siteDir := writeSite(t, map[string]string{"index.html": "<html>INDEX</html>"})
+		// 用非法端口让 serve 在监听阶段失败：既证明真的走进了 serve，又不会阻塞测试。
+		// --open/--livereload 是 serve 专属参数，能解析就说明确实是同一条命令。
+		_, stderr, err := executeCLIInSite(t, siteDir, "dev",
+			"--open=false", "--livereload=false", "--addr", "127.0.0.1:-1")
+		if err == nil {
+			t.Fatal("非法端口应当报错")
+		}
+		if strings.Contains(stderr, "unknown flag") {
+			t.Fatalf("dev 应支持 serve 的专属参数: %s", stderr)
+		}
+		if !strings.Contains(err.Error(), ":") && !strings.Contains(err.Error(), "port") {
+			t.Fatalf("错误应来自监听阶段: %v", err)
+		}
+	})
+}
+
+// TestLoggerUsesReadableTimeFormat 覆盖日志时间戳格式：time.DateTime（2006-01-02 15:04:05）。
+// 不带毫秒与时区偏移，终端里对齐更整齐；含空格所以 slog 会自动加引号。
+func TestLoggerUsesReadableTimeFormat(t *testing.T) {
+	var buffer syncBuffer
+	logger := newLogger(&buffer)
+	logger.Info("测试消息", "key", "value")
+
+	line := strings.TrimSpace(buffer.String())
+	if !strings.HasPrefix(line, `time="`) {
+		t.Fatalf("时间戳应被引号包裹（含空格）: %q", line)
+	}
+	timestamp, rest, found := strings.Cut(strings.TrimPrefix(line, `time="`), `"`)
+	if !found {
+		t.Fatalf("时间戳缺少结束引号: %q", line)
+	}
+	if _, err := time.Parse(time.DateTime, timestamp); err != nil {
+		t.Fatalf("时间戳应能用 time.DateTime 解析，实际 %q: %v", timestamp, err)
+	}
+	if len(timestamp) != len("2006-01-02 15:04:05") {
+		t.Fatalf("时间戳长度应为 %d，实际 %q", len("2006-01-02 15:04:05"), timestamp)
+	}
+	if want := " level=INFO msg=测试消息 key=value"; rest != want {
+		t.Fatalf("日志其余部分 = %q，期望 %q", rest, want)
 	}
 }

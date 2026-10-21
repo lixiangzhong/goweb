@@ -117,7 +117,7 @@ func gitCheckIgnore(t *testing.T, dir string, candidates []string) map[string]bo
 	}
 
 	ignored := make(map[string]bool, len(candidates))
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		if line = strings.TrimSpace(line); line != "" {
 			ignored[filepath.ToSlash(line)] = true
 		}

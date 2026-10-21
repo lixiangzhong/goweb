@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -306,17 +307,7 @@ func TestGenCommandOutDirBoundary(t *testing.T) {
 	if _, stderr, err := executeCLIInSite(t, dir, "gen", "--out", "d2"); err != nil {
 		t.Fatalf("gen --out d2: %v（stderr: %s）", err, stderr)
 	}
-	if got := listFiles(t, filepath.Join(dir, "d2")); !containsString(got, "dist/index.html") {
+	if got := listFiles(t, filepath.Join(dir, "d2")); !slices.Contains(got, "dist/index.html") {
 		t.Fatalf("方案 A 下旧产物目录应被当资源拷贝，实际 = %v", got)
 	}
-}
-
-// containsString 判断切片里是否有该元素（测试断言用）。
-func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
 }

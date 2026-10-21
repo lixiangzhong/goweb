@@ -112,7 +112,7 @@ func ifErrorIsInUse(err error) string {
 func occupyConsecutivePorts(t *testing.T, count int) (string, func()) {
 	t.Helper()
 
-	for attempt := 0; attempt < 50; attempt++ {
+	for range 50 {
 		probe, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatalf("探测空闲端口: %v", err)
@@ -123,7 +123,7 @@ func occupyConsecutivePorts(t *testing.T, count int) (string, func()) {
 		addresses := make([]string, 0, count)
 		listeners := make([]net.Listener, 0, count)
 		fail := false
-		for offset := 0; offset < count; offset++ {
+		for offset := range count {
 			addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(basePort+offset))
 			listener, err := net.Listen("tcp", addr)
 			if err != nil {

@@ -313,6 +313,103 @@ func TestE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("dev 别名等价于 serve", func(t *testing.T) {
+		siteDir := writeE2ESite(t)
+		server := startServeProcess(t, binary, siteDir, nil,
+			[]string{"dev", "--open=false", "--addr", "127.0.0.1:0"})
+		client := &http.Client{Timeout: e2eHTTPTimeout}
+		status, body := e2eGet(t, client, server.url+"/about.html")
+		if status != 200 || !strings.Contains(body, "E2E-SITE") {
+			t.Fatalf("dev 应像 serve 一样提供页面: status=%d body=%s", status, body)
+		}
+		if logs := server.logs(); !strings.Contains(logs, "mode=dev") {
+			t.Fatalf("dev 应与 serve 一样默认 dev 模式: %s", logs)
+		}
+		// 别名要出现在帮助里，用户才知道它存在。
+		if code, stdout, _ := runBinary(t, binary, "serve", "--help"); code != 0 || !strings.Contains(stdout, "dev") {
+			t.Fatalf("serve --help 应提示别名 dev: code=%d stdout=%q", code, stdout)
+		}
+	})
+
+	t.Run("init 生成配置且不覆盖已有文件", func(t *testing.T) {
+		siteDir := writeE2ESite(t)
+
+		code, stdout, stderr := runBinaryIn(t, siteDir, binary, "init")
+		if code != 0 {
+			t.Fatalf("init 退出码 = %d（stderr: %s）", code, stderr)
+		}
+		if !strings.Contains(stdout, ".goweb.yml") || !strings.Contains(stdout, "goweb dev") {
+			t.Fatalf("init 应打印生成路径与下一步: %s", stdout)
+		}
+		configPath := filepath.Join(siteDir, ".goweb.yml")
+		before := readFile(t, configPath)
+		if !strings.Contains(before, "minify: true") {
+			t.Fatalf("生成的配置应含默认值: %s", before)
+		}
+
+		// 第二次：报错退出（非 0），且不碰已有文件。
+		if code, _, stderr := runBinaryIn(t, siteDir, binary, "init"); code == 0 || !strings.Contains(stderr, "已存在") {
+			t.Fatalf("已存在时应报错退出: code=%d stderr=%s", code, stderr)
+		}
+		if after := readFile(t, configPath); after != before {
+			t.Fatal("报错时不应改动已有配置")
+		}
+
+		// --force 后，用生成的配置跑通 build。
+		if code, _, stderr := runBinaryIn(t, siteDir, binary, "init", "--force"); code != 0 {
+			t.Fatalf("init --force 退出码 = %d（stderr: %s）", code, stderr)
+		}
+		out := filepath.Join(t.TempDir(), "dist")
+		if code, _, stderr := runBinaryIn(t, siteDir, binary, "build", "--out", out); code != 0 {
+			t.Fatalf("用生成的配置跑 build 失败: code=%d stderr=%s", code, stderr)
+		}
+		if index := readFile(t, filepath.Join(out, "index.html")); !strings.Contains(index, "E2E-SITE") {
+			t.Fatalf("产物内容不正确: %s", index)
+		}
+	})
+
+	t.Run("check 只校验不产出", func(t *testing.T) {
+		siteDir := writeE2ESite(t)
+
+		// 正常站点：通过，且不产生任何产物。
+		code, _, stderr := runBinaryIn(t, siteDir, binary, "check")
+		if code != 0 {
+			t.Fatalf("check 退出码 = %d，期望 0（stderr: %s）", code, stderr)
+		}
+		if !strings.Contains(stderr, "检查通过") {
+			t.Fatalf("check 应报告通过: %s", stderr)
+		}
+		if _, err := os.Stat(filepath.Join(siteDir, "dist")); !os.IsNotExist(err) {
+			t.Fatalf("check 不应创建产物目录: %v", err)
+		}
+
+		// 故意加一个坏链接与一个渲染失败：问题要一次全部列出。
+		writeFile(t, filepath.Join(siteDir, "index.html"),
+			`<html><body><a href="/pages/about.html">坏链接</a><a href="/static">目录</a></body></html>`)
+		writeFile(t, filepath.Join(siteDir, "help", "bad.html"), `<html><body>{{fail "故意失败"}}</body></html>`)
+		code, _, stderr = runBinaryIn(t, siteDir, binary, "check")
+		if code == 0 {
+			t.Fatalf("有问题时 check 应非零退出: %s", stderr)
+		}
+		for _, want := range []string{"故意失败", "链接在产物里不存在：/pages/about.html", "链接在产物里不存在：/static（"} {
+			if !strings.Contains(stderr, want) {
+				t.Errorf("check 输出缺少 %q:\n%s", want, stderr)
+			}
+		}
+
+		// --links=false 时链接不再检查，渲染失败照旧报。
+		code, _, stderr = runBinaryIn(t, siteDir, binary, "check", "--links=false")
+		if code == 0 {
+			t.Fatal("渲染失败时仍应非零退出")
+		}
+		if strings.Contains(stderr, "链接在产物里不存在") {
+			t.Fatalf("--links=false 时不应检查链接: %s", stderr)
+		}
+		if !strings.Contains(stderr, "故意失败") {
+			t.Fatalf("渲染失败仍应报出: %s", stderr)
+		}
+	})
+
 	t.Run("gen 遇到坏数据直接失败", func(t *testing.T) {
 		broken := writeE2ESite(t)
 		writeFile(t, filepath.Join(broken, "templates", "data.json"), `{"site": }`)
