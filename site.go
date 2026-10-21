@@ -39,14 +39,33 @@ const (
 )
 
 // SiteOptions 描述站点目录约定，serve 与 gen 共用。
+//
+// 三个根（页面 / 模板 / 资源）彼此独立：
+//   - Dir 是页面根，递归出现的 *.html 都是页面，页面 URL 与产物路径以它为基准；
+//   - TemplateDir 是模板根，放局部模板与 data.json，**不受 Dir 影响**；
+//   - AssetsRoot 是资源根，其余文件按它映射到产物。
+//
+// 所有相对路径都以 ProjectRoot 为基准；ProjectRoot 为空时退化为 Dir
+// （即旧版单根行为：页面、模板、资源都在同一个目录下）。
 type SiteOptions struct {
-	// Dir 是页面目录，其中递归出现的 *.html 都视为页面。
+	// ProjectRoot 是项目根；所有相对路径的解析基准。置空表示用 Dir。
+	ProjectRoot string
+	// Dir 是页面根（相对 ProjectRoot，也可以是绝对路径）。
 	Dir string
-	// TemplateDir 是局部模板目录（相对 Dir）；其中内容只参与模板解析，不产出页面。
-	// 置空表示没有独立的局部模板目录。
+	// TemplateDir 是模板根（相对 ProjectRoot，也可以是绝对路径）；
+	// 其中内容只参与模板解析、不产出页面，也不可被访问。置空表示没有独立模板根。
 	TemplateDir string
-	// ExcludeDirs 是不参与扫描的目录（相对 Dir），例如 gen 的产物目录。
+	// AssetsRoot 是资源根（相对 ProjectRoot，也可以是绝对路径）；置空表示用 ProjectRoot。
+	AssetsRoot string
+	// ExcludeDirs 是不参与扫描的目录（相对 ProjectRoot），例如 gen 的产物目录。
 	ExcludeDirs []string
+	// IgnorePatterns 是额外的忽略模式（与 .gitignore 同语法），叠加在 .gitignore 之上。
+	IgnorePatterns []string
+	// UseGitignore 表示是否读取 ProjectRoot 下的 .gitignore。
+	UseGitignore bool
+	// Publishing 表示当前在为产物工作（gen）：忽略规则生效，且引用被忽略的资源会报错。
+	// serve 下为 false：被忽略的文件本地依然可见，方便预览草稿。
+	Publishing bool
 	// Mode 是渲染模式；置空按 ModeDev 处理。
 	Mode Mode
 	// BuildTime 是模板里的构建时间；为零值时取站点内容里最新的文件修改时间，
@@ -62,18 +81,24 @@ type SiteOptions struct {
 // {{define "x"}} 能被任意页面 {{template "x" .}} 引用；
 // 模板数据来自模板目录下的 data.json，页面与局部模板共用同一份数据。
 type Site struct {
-	// root 是页面目录的绝对路径。
+	// root 是项目根的绝对路径（所有相对路径的基准）。
 	root string
+	// pagesRoot、templateRoot、assetsRoot 是三个根的绝对路径。
+	pagesRoot    string
+	templateRoot string
+	assetsRoot   string
 	// excludes 是排除目录的绝对路径。
 	excludes []string
-	// templatePrefix 是归一化后的局部模板目录（相对 root，斜杠分隔）。
-	templatePrefix string
 	// mode 是渲染模式（dev / prod）。
 	mode Mode
 	// buildTimeOverride 非零时作为模板里的构建时间。
 	buildTimeOverride time.Time
 	// fingerprint 表示是否自动给资源引用补版本号。
 	fingerprint bool
+	// publishing 表示当前在为产物工作（gen）：忽略规则生效。
+	publishing bool
+	// ignore 是忽略规则；只在 publishing 为真时生效。
+	ignore *ignoreMatcher
 
 	mu        sync.RWMutex
 	tmpl      *template.Template
@@ -93,28 +118,69 @@ type siteSnapshot struct {
 	rewrite   func(pageName string, body []byte) ([]byte, error)
 }
 
-// LoadSite 扫描页面目录并编译全部模板。
+// LoadSite 扫描页面根并编译全部模板。
 func LoadSite(opts SiteOptions) (*Site, error) {
-	root, err := filepath.Abs(opts.Dir)
-	if err != nil {
-		return nil, fmt.Errorf("解析页面目录 %q: %w", opts.Dir, err)
+	// 项目根是相对路径的基准；未指定时退化为页面根，保持旧版单根语义。
+	projectRootInput := opts.ProjectRoot
+	if strings.TrimSpace(projectRootInput) == "" {
+		projectRootInput = opts.Dir
 	}
+	projectRoot, err := filepath.Abs(projectRootInput)
+	if err != nil {
+		return nil, fmt.Errorf("解析项目根 %q: %w", projectRootInput, err)
+	}
+
 	mode := opts.Mode
 	if mode == "" {
 		mode = ModeDev
 	}
+
 	site := &Site{
-		root:              root,
-		excludes:          absoluteDirs(root, opts.ExcludeDirs),
-		templatePrefix:    cleanRelativeDir(opts.TemplateDir),
+		root:              projectRoot,
+		excludes:          absoluteDirs(projectRoot, opts.ExcludeDirs),
 		mode:              mode,
 		buildTimeOverride: opts.BuildTime,
 		fingerprint:       opts.Fingerprint,
+		publishing:        opts.Publishing,
 	}
+	if site.pagesRoot, err = resolveRoot(projectRoot, opts.Dir, "."); err != nil {
+		return nil, fmt.Errorf("解析页面根: %w", err)
+	}
+	if site.templateRoot, err = resolveRoot(projectRoot, opts.TemplateDir, ""); err != nil {
+		return nil, fmt.Errorf("解析模板根: %w", err)
+	}
+	if site.assetsRoot, err = resolveRoot(projectRoot, opts.AssetsRoot, "."); err != nil {
+		return nil, fmt.Errorf("解析资源根: %w", err)
+	}
+	// 忽略规则只在产出产物时生效（serve 仍可见被忽略的文件）。
+	if site.publishing {
+		matcher, err := loadIgnoreMatcher(projectRoot, opts.UseGitignore, opts.IgnorePatterns)
+		if err != nil {
+			return nil, err
+		}
+		site.ignore = matcher
+	}
+
 	if err := site.Reload(); err != nil {
 		return nil, err
 	}
 	return site, nil
+}
+
+// resolveRoot 把配置里的根解析成绝对路径：绝对路径原样使用，
+// 相对路径相对项目根；值为空时用 fallback（fallback 为空表示没有这个根）。
+func resolveRoot(projectRoot, value, fallback string) (string, error) {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		raw = fallback
+	}
+	if raw == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(raw) {
+		raw = filepath.Join(projectRoot, raw)
+	}
+	return filepath.Abs(raw)
 }
 
 // Reload 重新扫描并编译模板；失败时保留原有模板集合，因此调用方可以自行决定
@@ -131,9 +197,62 @@ func (s *Site) Reload() error {
 	return nil
 }
 
-// Root 返回页面目录的绝对路径。
+// Root 返回项目根的绝对路径（所有相对路径的基准）。
 func (s *Site) Root() string {
 	return s.root
+}
+
+// PagesRoot 返回页面根的绝对路径。
+func (s *Site) PagesRoot() string {
+	return s.pagesRoot
+}
+
+// TemplateRoot 返回模板根的绝对路径；没有模板根时返回空字符串。
+func (s *Site) TemplateRoot() string {
+	return s.templateRoot
+}
+
+// AssetsRoot 返回资源根的绝对路径。
+func (s *Site) AssetsRoot() string {
+	return s.assetsRoot
+}
+
+// ignoredForOutput 判断绝对路径在产出产物时是否被忽略规则排除。
+// serve（非 publishing）下恒为 false：被忽略的文件本地依然可见，方便预览草稿。
+func (s *Site) ignoredForOutput(absPath string, isDir bool) bool {
+	if !s.publishing || s.ignore == nil {
+		return false
+	}
+	rel, err := filepath.Rel(s.root, absPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return s.ignore.Match(filepath.ToSlash(rel), isDir)
+}
+
+// templateName 给出模板根里某个文件的模板名：
+// 落在项目根内时用「相对项目根的路径」，这样默认布局下仍是 templates/header 这种旧写法；
+// 模板根在项目根之外时退回「相对模板根的路径」。
+func (s *Site) templateName(filePath string) (string, error) {
+	ext := filepath.Ext(filePath)
+
+	base := s.root
+	rel, err := filepath.Rel(base, filePath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		base = s.templateRoot
+		rel, err = filepath.Rel(base, filePath)
+		if err != nil {
+			return "", fmt.Errorf("计算模板相对路径 %s: %w", filePath, err)
+		}
+	}
+	return strings.TrimSuffix(filepath.ToSlash(rel), ext), nil
+}
+
+// pageFile 返回页面模板名对应的源文件路径；不存在时返回空字符串。
+func (s *Site) pageFile(name string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.pages[name]
 }
 
 // Mode 返回渲染模式（dev / prod）。
@@ -156,23 +275,48 @@ func (s *Site) assetFile(urlPath string) (string, error) {
 	if rel == "" {
 		return "", errors.New("asset 需要资源路径，例如 {{asset \"/static/css/site.css\"}}")
 	}
-	full := filepath.Join(s.root, filepath.FromSlash(rel))
-	back, err := filepath.Rel(s.root, full)
-	if err != nil || back == ".." || strings.HasPrefix(back, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("asset 路径越出站点目录：%s", urlPath)
-	}
-	if s.Ignored(full) || s.WithinTemplateDir(full) {
+	full, ok := s.resolveURL(rel, false)
+	if !ok {
 		return "", fmt.Errorf("asset 只接受会进入产物的静态资源：%s", urlPath)
 	}
 	ext := filepath.Ext(rel)
 	if strings.EqualFold(ext, pageExt) && s.hasPage(strings.TrimSuffix(rel, ext)) {
 		return "", fmt.Errorf("asset 不接受页面（页面是渲染产物，请直接写路径）：%s", urlPath)
 	}
+	if s.ignoredForOutput(full, false) {
+		return "", fmt.Errorf("资源被忽略规则排除，产物里不会有它：%s", urlPath)
+	}
 	info, err := os.Stat(full)
 	if err != nil || !info.Mode().IsRegular() {
 		return "", fmt.Errorf("asset 找不到静态资源：%s", urlPath)
 	}
 	return full, nil
+}
+
+// resolveURL 把 URL 相对路径解析成磁盘文件，页面根优先、资源根兜底。
+// requirePages 为真时只查页面根（用于判断「这个 URL 属于页面根空间」）。
+func (s *Site) resolveURL(rel string, requirePages bool) (string, bool) {
+	candidates := []string{s.pagesRoot}
+	if !requirePages {
+		candidates = append(candidates, s.assetsRoot)
+	}
+	for _, root := range candidates {
+		if root == "" {
+			continue
+		}
+		full := filepath.Join(root, filepath.FromSlash(rel))
+		if back, err := filepath.Rel(root, full); err != nil ||
+			back == ".." || strings.HasPrefix(back, ".."+string(filepath.Separator)) {
+			continue
+		}
+		if s.Ignored(full) || s.WithinTemplateDir(full) {
+			continue
+		}
+		if info, err := os.Stat(full); err == nil && info.Mode().IsRegular() {
+			return full, true
+		}
+	}
+	return "", false
 }
 
 // Pages 返回排序后的页面模板名，例如 index、about、help/74。
@@ -187,12 +331,12 @@ func (s *Site) Pages() []string {
 	return names
 }
 
-// DataFile 返回数据文件路径；没有配置局部模板目录时返回空字符串。
+// DataFile 返回数据文件路径（模板根下的 data.json）；没有模板根时返回空字符串。
 func (s *Site) DataFile() string {
-	if s.templatePrefix == "" {
+	if s.templateRoot == "" {
 		return ""
 	}
-	return filepath.Join(s.root, filepath.FromSlash(s.templatePrefix), dataFileName)
+	return filepath.Join(s.templateRoot, dataFileName)
 }
 
 // Render 渲染指定模板并返回 HTML 内容，渲染数据为 data.json 的顶层对象。
@@ -222,22 +366,29 @@ func (s *Site) Render(name string) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// WithinTemplateDir 判断绝对路径是否落在局部模板目录内。
+// WithinTemplateDir 判断绝对路径是否落在模板根内。
 func (s *Site) WithinTemplateDir(absPath string) bool {
-	if s.templatePrefix == "" {
+	return withinDir(s.templateRoot, absPath)
+}
+
+// withinDir 判断 absPath 是否位于 dir 内（dir 为空表示没有这个根）。
+func withinDir(dir, absPath string) bool {
+	if dir == "" {
 		return false
 	}
-	rel, err := filepath.Rel(s.root, absPath)
-	if err != nil {
-		return false
+	if absPath == dir {
+		return true
 	}
-	return s.isTemplateFile(rel)
+	return strings.HasPrefix(absPath, dir+string(filepath.Separator))
 }
 
 // Ignored 判断路径是否属于扫描与监听都忽略的范围，用于过滤文件系统事件。
 func (s *Site) Ignored(filePath string) bool {
+	if !s.withinAnyRoot(filePath) {
+		return true
+	}
 	rel, err := filepath.Rel(s.root, filePath)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if err != nil {
 		return true
 	}
 	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
@@ -248,36 +399,61 @@ func (s *Site) Ignored(filePath string) bool {
 	return s.isExcluded(filePath)
 }
 
+// withinAnyRoot 判断路径是否落在三个根之内。
+func (s *Site) withinAnyRoot(filePath string) bool {
+	for _, root := range []string{s.pagesRoot, s.templateRoot, s.assetsRoot} {
+		if withinDir(root, filePath) {
+			return true
+		}
+	}
+	return false
+}
+
 // WatchPaths 返回需要监听的文件系统路径（目录与文件）。
 //
 // darwin 上 fsnotify 走 kqueue 后端，监听目录不会收到目录内文件内容变更，
 // 因此文件与目录都要单独挂监听。
 func (s *Site) WatchPaths() ([]string, error) {
+	seen := make(map[string]bool)
 	var paths []string
-	err := filepath.WalkDir(s.root, func(filePath string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+
+	for _, root := range []string{s.pagesRoot, s.templateRoot, s.assetsRoot} {
+		if root == "" {
+			continue
 		}
-		if filePath != s.root && s.skipPath(filePath, entry.IsDir()) {
-			if entry.IsDir() {
-				return fs.SkipDir
+		err := filepath.WalkDir(root, func(filePath string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				// 根可能不存在（例如站点还没建 templates/），忽略即可。
+				return nil //nolint:nilerr
+			}
+			if filePath != root && s.skipPath(filePath, entry.IsDir()) {
+				if entry.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			if !seen[filePath] {
+				seen[filePath] = true
+				paths = append(paths, filePath)
 			}
 			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("收集监听路径: %w", err)
 		}
-		paths = append(paths, filePath)
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("收集监听路径: %w", err)
 	}
 	return paths, nil
 }
 
 // compile 构造一次完整快照：模板命名空间、页面清单、data.json 数据与构建时间，
 // 任一步失败即整体失败。
+//
+// 页面来自页面根；局部模板来自模板根（两处独立解析，模板文件不会成为页面）。
+// 模板名沿用「相对项目根的路径去扩展名」，页面名是「相对页面根的路径去扩展名」，
+// 因此默认布局下模板名仍是 templates/header 这类旧写法。
 func (s *Site) compile() (siteSnapshot, error) {
 	var snapshot siteSnapshot
-	snapshot.tmpl = template.New(s.root)
+	snapshot.tmpl = template.New(s.pagesRoot)
 	snapshot.pages = make(map[string]string)
 
 	// 模板函数绑定在本次加载的上下文上：模式、构建时间与资源哈希都随快照一起生效。
@@ -285,13 +461,24 @@ func (s *Site) compile() (siteSnapshot, error) {
 	funcs := templateFuncs(ctx)
 
 	// 站点内容里最新的文件修改时间，作为「构建时间」的默认值。
-	var newest time.Time
+	newest := s.newestModTime()
 
-	err := filepath.WalkDir(s.root, func(filePath string, entry fs.DirEntry, walkErr error) error {
+	// 模板根与页面根重合（或未配置模板根）时，页面根里的 html 全是页面。
+	separateTemplateRoot := s.templateRoot != "" && s.templateRoot != s.pagesRoot
+	templateFiles := make([]string, 0, 16)
+
+	err := filepath.WalkDir(s.pagesRoot, func(filePath string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if filePath != s.root && s.skipPath(filePath, entry.IsDir()) {
+		if filePath != s.pagesRoot && s.skipPath(filePath, entry.IsDir()) {
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		// 模板根落在页面根里时，那里的 html 是局部模板：交给下面单独解析。
+		if separateTemplateRoot && filePath != s.pagesRoot && s.WithinTemplateDir(filePath) {
 			if entry.IsDir() {
 				return fs.SkipDir
 			}
@@ -300,14 +487,11 @@ func (s *Site) compile() (siteSnapshot, error) {
 		if entry.IsDir() {
 			return nil
 		}
-		if info, err := entry.Info(); err == nil && info.ModTime().After(newest) {
-			newest = info.ModTime()
-		}
 		ext := filepath.Ext(filePath)
 		if !strings.EqualFold(ext, pageExt) {
 			return nil
 		}
-		rel, err := filepath.Rel(s.root, filePath)
+		rel, err := filepath.Rel(s.pagesRoot, filePath)
 		if err != nil {
 			return fmt.Errorf("计算相对路径 %s: %w", filePath, err)
 		}
@@ -319,13 +503,58 @@ func (s *Site) compile() (siteSnapshot, error) {
 		if _, err := snapshot.tmpl.New(name).Funcs(funcs).Parse(string(body)); err != nil {
 			return fmt.Errorf("解析模板 %s: %w", rel, err)
 		}
-		if !s.isTemplateFile(rel) {
-			snapshot.pages[name] = filePath
-		}
+		snapshot.pages[name] = filePath
 		return nil
 	})
 	if err != nil {
 		return snapshot, err
+	}
+
+	// 单独解析模板根：模板根可能完全在页面根之外，页面扫描看不到它。
+	// 模板根不存在属于正常情况（站点可以没有局部模板）。
+	if separateTemplateRoot {
+		if _, statErr := os.Stat(s.templateRoot); errors.Is(statErr, fs.ErrNotExist) {
+			separateTemplateRoot = false
+		}
+	}
+	if separateTemplateRoot {
+		err := filepath.WalkDir(s.templateRoot, func(filePath string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if filePath != s.templateRoot && s.skipPath(filePath, entry.IsDir()) {
+				if entry.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			ext := filepath.Ext(filePath)
+			if !strings.EqualFold(ext, pageExt) {
+				return nil
+			}
+			templateFiles = append(templateFiles, filePath)
+			return nil
+		})
+		if err != nil {
+			return snapshot, err
+		}
+	}
+
+	for _, filePath := range templateFiles {
+		name, err := s.templateName(filePath)
+		if err != nil {
+			return snapshot, err
+		}
+		body, err := os.ReadFile(filePath)
+		if err != nil {
+			return snapshot, fmt.Errorf("读取模板 %s: %w", filePath, err)
+		}
+		if _, err := snapshot.tmpl.New(name).Funcs(funcs).Parse(string(body)); err != nil {
+			return snapshot, fmt.Errorf("解析模板 %s: %w", filePath, err)
+		}
 	}
 
 	data, err := s.loadData()
@@ -354,6 +583,35 @@ func (s *Site) compile() (siteSnapshot, error) {
 		snapshot.rewrite = ctx.fingerprintHTML
 	}
 	return snapshot, nil
+}
+
+// newestModTime 返回三个根下（忽略项之外）最新的文件修改时间。
+func (s *Site) newestModTime() time.Time {
+	var newest time.Time
+	for _, root := range []string{s.pagesRoot, s.templateRoot, s.assetsRoot} {
+		if root == "" {
+			continue
+		}
+		_ = filepath.WalkDir(root, func(filePath string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return nil //nolint:nilerr // 根不存在属于正常情况
+			}
+			if filePath != root && s.skipPath(filePath, entry.IsDir()) {
+				if entry.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			if info, err := entry.Info(); err == nil && info.ModTime().After(newest) {
+				newest = info.ModTime()
+			}
+			return nil
+		})
+	}
+	return newest
 }
 
 // loadData 读取模板目录下的 data.json 作为模板数据。
@@ -397,15 +655,6 @@ func (s *Site) isExcluded(filePath string) bool {
 		}
 	}
 	return false
-}
-
-// isTemplateFile 判断相对路径是否位于局部模板目录内。
-func (s *Site) isTemplateFile(rel string) bool {
-	if s.templatePrefix == "" {
-		return false
-	}
-	slashed := filepath.ToSlash(rel)
-	return slashed == s.templatePrefix || strings.HasPrefix(slashed, s.templatePrefix+"/")
 }
 
 // hasPage 判断模板名是否为页面（局部模板不算页面）。
@@ -518,27 +767,14 @@ func pageNameOf(rel string) string {
 	return strings.TrimSuffix(rel, ext)
 }
 
-// servableFile 把 URL 相对路径解析为可对外提供的常规文件。
-// 局部模板目录、产物目录与扫描忽略项（隐藏项、node_modules）一律视为不存在，
-// 与 gen 产物部署后的行为保持一致。
+// servableFile 把 URL 相对路径解析为可对外提供的常规文件：
+// 先查页面根（页面根空间优先），再查资源根；模板根、产物目录与扫描忽略项
+// （隐藏项、node_modules）一律视为不存在。
 func (s *Site) servableFile(rel string) (string, bool) {
 	if rel == "" {
 		return "", false
 	}
-	full := filepath.Join(s.root, filepath.FromSlash(rel))
-	// 归一化已经消除了 .. 段，这里再做一次边界校验，避免拼接结果逃出页面目录。
-	back, err := filepath.Rel(s.root, full)
-	if err != nil || back == ".." || strings.HasPrefix(back, ".."+string(filepath.Separator)) {
-		return "", false
-	}
-	if s.Ignored(full) || s.WithinTemplateDir(full) {
-		return "", false
-	}
-	info, err := os.Stat(full)
-	if err != nil || !info.Mode().IsRegular() {
-		return "", false
-	}
-	return full, true
+	return s.resolveURL(rel, false)
 }
 
 // normalizePath 按 nginx 的方式归一化 URL 路径：折叠重复斜杠、解析 . 与 .. 段，
@@ -592,19 +828,4 @@ func absoluteDirs(root string, dirs []string) []string {
 		absolute = append(absolute, filepath.Clean(trimmed))
 	}
 	return absolute
-}
-
-// cleanRelativeDir 归一化相对目录：统一成斜杠分隔、去掉 ./ 与前后的 /。
-func cleanRelativeDir(dir string) string {
-	trimmed := strings.TrimSpace(dir)
-	if trimmed == "" {
-		return ""
-	}
-	cleaned := filepath.ToSlash(filepath.Clean(trimmed))
-	cleaned = strings.TrimPrefix(cleaned, "./")
-	cleaned = strings.Trim(cleaned, "/")
-	if cleaned == "." {
-		return ""
-	}
-	return cleaned
 }

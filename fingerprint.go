@@ -32,7 +32,11 @@ func (c *renderContext) fingerprintHTML(pageName string, body []byte) ([]byte, e
 
 	// 页面 URL 与其源文件同目录，因此相对路径按页面所在目录解析。
 	pageDir := path.Dir(pageName)
-	if !c.rewriteAssets(document, pageDir) {
+	changed, err := c.rewriteAssets(document, pageDir)
+	if err != nil {
+		return nil, fmt.Errorf("处理页面 %s 的资源引用: %w", pageName, err)
+	}
+	if !changed {
 		return body, nil
 	}
 
@@ -44,7 +48,7 @@ func (c *renderContext) fingerprintHTML(pageName string, body []byte) ([]byte, e
 }
 
 // rewriteAssets 递归改写元素属性，返回是否有改动。
-func (c *renderContext) rewriteAssets(node *html.Node, pageDir string) bool {
+func (c *renderContext) rewriteAssets(node *html.Node, pageDir string) (bool, error) {
 	changed := false
 
 	if node.Type == html.ElementNode {
@@ -52,12 +56,20 @@ func (c *renderContext) rewriteAssets(node *html.Node, pageDir string) bool {
 			attribute := &node.Attr[i]
 			switch key := strings.ToLower(attribute.Key); {
 			case key == "srcset":
-				if rewritten, ok := c.fingerprintSrcset(pageDir, attribute.Val); ok {
+				rewritten, ok, err := c.fingerprintSrcset(pageDir, attribute.Val)
+				if err != nil {
+					return changed, err
+				}
+				if ok {
 					attribute.Val = rewritten
 					changed = true
 				}
 			case fingerprintedAttributes[key]:
-				if rewritten, ok := c.fingerprintURL(pageDir, attribute.Val); ok {
+				rewritten, ok, err := c.fingerprintURL(pageDir, attribute.Val)
+				if err != nil {
+					return changed, err
+				}
+				if ok {
 					attribute.Val = rewritten
 					changed = true
 				}
@@ -66,28 +78,34 @@ func (c *renderContext) rewriteAssets(node *html.Node, pageDir string) bool {
 	}
 
 	for child := node.FirstChild; child != nil; child = child.NextSibling {
-		if c.rewriteAssets(child, pageDir) {
+		childChanged, err := c.rewriteAssets(child, pageDir)
+		if err != nil {
+			return changed, err
+		}
+		if childChanged {
 			changed = true
 		}
 	}
-	return changed
+	return changed, nil
 }
 
 // fingerprintURL 判断 URL 是否指向站点内的静态资源，是则返回带版本号的 URL。
-// 不是可发布的静态资源（页面、局部模板、忽略项、不存在的文件）或本来就该原样保留的
-// 写法（外链、data:、锚点、已带查询串）都返回 false，由调用方保持原值。
-func (c *renderContext) fingerprintURL(pageDir, raw string) (string, bool) {
+//
+// 不是静态资源的写法（外链、data:、锚点、已带查询串、页面、局部模板、不存在的文件）
+// 返回 ok=false 由调用方保持原值；但「文件存在却因忽略规则不会进产物」是必须报错的
+// 情况——静默产出断链比报错糟得多。
+func (c *renderContext) fingerprintURL(pageDir, raw string) (string, bool, error) {
 	value := strings.TrimSpace(raw)
 	if value == "" || strings.HasPrefix(value, "#") {
-		return "", false
+		return "", false, nil
 	}
 	// 已带查询串或锚点时交给作者自己控制：追加参数会牵涉 & 的转义形态。
 	if strings.ContainsAny(value, "?#") {
-		return "", false
+		return "", false, nil
 	}
 	// 外链、协议相对 URL 与 data:/mailto:/tel: 这类带 scheme 的值一律不动。
 	if strings.Contains(value, "://") || strings.HasPrefix(value, "//") || hasScheme(value) {
-		return "", false
+		return "", false, nil
 	}
 
 	relative := strings.TrimPrefix(value, "/")
@@ -95,18 +113,23 @@ func (c *renderContext) fingerprintURL(pageDir, raw string) (string, bool) {
 		relative = path.Join(pageDir, relative)
 	}
 
+	// 文件存在但被忽略规则排除：产物里不会有它，直接报错。
+	if full, ok := c.site.resolveURL(relative, false); ok && c.site.ignoredForOutput(full, false) {
+		return "", false, fmt.Errorf("资源被忽略规则排除，产物里不会有它：%s", value)
+	}
+
 	hash, err := c.assetHash("/" + relative)
 	if err != nil {
-		return "", false
+		return "", false, nil
 	}
-	return value + "?v=" + hash, true
+	return value + "?v=" + hash, true, nil
 }
 
 // fingerprintSrcset 处理 srcset 里的多个候选：逗号分隔，每个候选是「URL [描述符]」。
-func (c *renderContext) fingerprintSrcset(pageDir, raw string) (string, bool) {
+func (c *renderContext) fingerprintSrcset(pageDir, raw string) (string, bool, error) {
 	// data: URL 自身含逗号，拆分不可靠，整条跳过。
 	if strings.HasPrefix(strings.TrimSpace(raw), "data:") {
-		return "", false
+		return "", false, nil
 	}
 
 	candidates := strings.Split(raw, ",")
@@ -116,16 +139,20 @@ func (c *renderContext) fingerprintSrcset(pageDir, raw string) (string, bool) {
 		if len(fields) == 0 {
 			continue
 		}
-		if rewritten, ok := c.fingerprintURL(pageDir, fields[0]); ok {
+		rewritten, ok, err := c.fingerprintURL(pageDir, fields[0])
+		if err != nil {
+			return "", false, err
+		}
+		if ok {
 			fields[0] = rewritten
 			candidates[i] = strings.Join(fields, " ")
 			changed = true
 		}
 	}
 	if !changed {
-		return "", false
+		return "", false, nil
 	}
-	return strings.Join(candidates, ", "), true
+	return strings.Join(candidates, ", "), true, nil
 }
 
 // hasScheme 识别 data:、mailto:、tel:、javascript: 这类带 scheme 的值。

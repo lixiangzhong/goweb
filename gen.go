@@ -54,14 +54,26 @@ func Generate(site *Site, opts GenOptions) (GenResult, error) {
 
 	logger := opts.logger()
 
+	// artifacts 记录产物路径 -> 来源，用于发现页面与资源撞同一路径。
+	artifacts := make(map[string]string)
+
 	for _, name := range site.Pages() {
+		source := site.pageFile(name)
+		// 忽略规则只作用于 gen：被忽略的页面本地可见（serve 照常），但不进产物。
+		if source != "" && site.ignoredForOutput(source, false) {
+			logger.Info("跳过被忽略的页面", "page", name, "source", source)
+			continue
+		}
 		body, err := site.Render(name)
 		if err != nil {
 			return result, fmt.Errorf("渲染页面 %s: %w", name, err)
 		}
-		// 产物严格跟随源码路径：about.html -> dist/about.html，
-		// help/74.html -> dist/help/74.html。
-		target := filepath.Join(out, filepath.FromSlash(name+pageExt))
+		// 页面产物跟随页面根：about.html -> dist/about.html。
+		rel := filepath.FromSlash(name + pageExt)
+		target := filepath.Join(out, rel)
+		if err := recordArtifact(artifacts, rel, source); err != nil {
+			return result, err
+		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return result, fmt.Errorf("创建页面目录 %q: %w", filepath.Dir(target), err)
 		}
@@ -71,12 +83,23 @@ func Generate(site *Site, opts GenOptions) (GenResult, error) {
 		result.Pages++
 	}
 
-	assets, err := copyAssets(site, out, logger)
+	assets, err := copyAssets(site, out, artifacts, logger)
 	if err != nil {
 		return result, err
 	}
 	result.Assets = assets
 	return result, nil
+}
+
+// recordArtifact 登记一个产物路径，撞车时直接报错（列出两个来源）。
+func recordArtifact(artifacts map[string]string, rel, source string) error {
+	normalized := filepath.ToSlash(filepath.Clean(rel))
+	if previous, ok := artifacts[normalized]; ok {
+		return fmt.Errorf("产物路径冲突：%s\n  来源一：%s\n  来源二：%s\n"+
+			"请调整页面根/资源根，或用 .goweb.yml 的 ignore 排除其中一个", normalized, previous, source)
+	}
+	artifacts[normalized] = source
+	return nil
 }
 
 // logger 返回可用的日志器，未配置时丢弃日志。
@@ -87,17 +110,32 @@ func (o GenOptions) logger() *slog.Logger {
 	return slog.New(slog.DiscardHandler)
 }
 
-// guardOutDir 拦截会破坏源码的产物目录：页面目录本身、页面目录的祖先、
-// 局部模板目录，以及文件系统根目录与用户主目录。
+// guardOutDir 拦截会破坏源码的产物目录：项目根、三个根本身或它们的父目录，
+// 以及用户主目录。
 func guardOutDir(site *Site, out string) error {
-	root := site.Root()
 	switch {
-	case out == root:
-		return fmt.Errorf("产物目录不能是页面目录本身：%s", out)
-	case isAncestor(out, root):
-		return fmt.Errorf("产物目录不能是页面目录的父目录：%s", out)
-	case site.WithinTemplateDir(out):
-		return fmt.Errorf("产物目录不能是局部模板目录：%s", out)
+	case out == site.Root():
+		return fmt.Errorf("产物目录不能是项目根：%s", out)
+	case isAncestor(out, site.Root()):
+		return fmt.Errorf("产物目录不能是项目根的父目录：%s", out)
+	}
+	for _, root := range []struct {
+		name string
+		path string
+	}{
+		{name: "页面根", path: site.PagesRoot()},
+		{name: "模板根", path: site.TemplateRoot()},
+		{name: "资源根", path: site.AssetsRoot()},
+	} {
+		if root.path == "" {
+			continue
+		}
+		if out == root.path {
+			return fmt.Errorf("产物目录不能是%s：%s", root.name, out)
+		}
+		if isAncestor(out, root.path) {
+			return fmt.Errorf("产物目录不能是%s的父目录：%s", root.name, out)
+		}
 	}
 	if home, err := os.UserHomeDir(); err == nil && home != "" && out == filepath.Clean(home) {
 		return fmt.Errorf("拒绝把用户主目录当作产物目录：%s", out)
@@ -131,18 +169,21 @@ func cleanDir(dir string) error {
 	return nil
 }
 
-// copyAssets 把页面与局部模板之外的文件原样拷贝到产物目录，保持相对路径不变。
-// 页面 html 由模板渲染产出，因此不参与拷贝。
-func copyAssets(site *Site, out string, logger *slog.Logger) (int, error) {
-	root := site.Root()
-	outInRoot := out == root || strings.HasPrefix(out, root+string(filepath.Separator))
+// copyAssets 把资源根下、页面与模板之外的文件拷进产物。
+//
+// 产物路径按「所属根」决定：位于页面根内的文件按页面根相对路径
+// （这样页面里的相对引用才对得上），其余按资源根相对路径。
+// 被忽略规则排除的文件不进产物，并记录日志。
+func copyAssets(site *Site, out string, artifacts map[string]string, logger *slog.Logger) (int, error) {
+	assetsRoot := site.AssetsRoot()
+	outInAssets := withinDir(assetsRoot, out) || out == assetsRoot
 	count := 0
 
-	err := filepath.WalkDir(root, func(filePath string, entry fs.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(assetsRoot, func(filePath string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if filePath == root {
+		if filePath == assetsRoot {
 			return nil
 		}
 		if site.skipPath(filePath, entry.IsDir()) {
@@ -151,42 +192,62 @@ func copyAssets(site *Site, out string, logger *slog.Logger) (int, error) {
 			}
 			return nil
 		}
-		if outInRoot && (filePath == out || strings.HasPrefix(filePath, out+string(filepath.Separator))) {
+		// 产物目录本身不参与拷贝（它在资源根里时）。
+		if outInAssets && withinDir(out, filePath) {
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		// 模板根的内容不进产物。
+		if site.WithinTemplateDir(filePath) {
 			if entry.IsDir() {
 				return fs.SkipDir
 			}
 			return nil
 		}
 
-		rel, err := filepath.Rel(root, filePath)
+		rel, err := filepath.Rel(assetsRoot, filePath)
 		if err != nil {
 			return fmt.Errorf("计算相对路径 %s: %w", filePath, err)
 		}
-		if site.isTemplateFile(rel) {
-			if entry.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
+
 		if entry.IsDir() {
 			return nil
 		}
-		if strings.EqualFold(filepath.Ext(filePath), pageExt) {
+
+		// 页面根里的 html 已由模板渲染产出，不再当资源拷贝；
+		// 页面根外的 html 是普通文件，照原样拷贝。
+		if withinDir(site.PagesRoot(), filePath) {
+			if strings.EqualFold(filepath.Ext(filePath), pageExt) {
+				return nil
+			}
+			// 页面根内的非 html 文件按页面根映射，保证与页面 URL 一致。
+			if pageRel, err := filepath.Rel(site.PagesRoot(), filePath); err == nil {
+				rel = pageRel
+			}
+		}
+
+		if site.ignoredForOutput(filePath, false) {
+			logger.Info("跳过被忽略的文件", "file", filepath.ToSlash(rel))
 			return nil
 		}
 
-		target := filepath.Join(out, rel)
 		if entry.Type()&fs.ModeSymlink != 0 {
 			isDir, err := symlinkToDir(filePath)
 			if err != nil {
 				return err
 			}
 			if isDir {
-				logger.Warn("跳过指向目录的符号链接", "path", rel)
+				logger.Warn("跳过指向目录的符号链接", "path", filepath.ToSlash(rel))
 				return nil
 			}
 		}
-		if err := copyFile(filePath, target); err != nil {
+
+		if err := recordArtifact(artifacts, rel, filePath); err != nil {
+			return err
+		}
+		if err := copyFile(filePath, filepath.Join(out, rel)); err != nil {
 			return err
 		}
 		count++
