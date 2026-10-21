@@ -10,3 +10,6 @@
 .DS_Store
 .idea/
 .vscode/
+
+# 项目记忆（含本地路径与个人偏好，不入库）
+.memory/
