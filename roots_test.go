@@ -172,9 +172,14 @@ func TestArtifactPathConflict(t *testing.T) {
 	if !strings.Contains(err.Error(), "产物路径冲突") {
 		t.Fatalf("错误信息应说明冲突: %v", err)
 	}
-	for _, want := range []string{"pages/static/app.js", "static/app.js"} {
+	// 来源是磁盘路径，Windows 上用反斜杠，因此按平台拼接后再断言；产物相对路径统一是斜杠。
+	sources := []string{
+		filepath.Join("pages", "static", "app.js"),
+		filepath.Join("static", "app.js"),
+	}
+	for _, want := range append(sources, "产物路径冲突", "来源一", "来源二") {
 		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("错误信息应列出两个来源（缺少 %s）: %v", want, err)
+			t.Fatalf("错误信息应包含 %q，实际: %v", want, err)
 		}
 	}
 }
@@ -252,13 +257,16 @@ func TestConfigUpwardDiscovery(t *testing.T) {
 
 // TestResolveRoot 覆盖根解析：绝对路径原样、相对路径相对项目根、空值用 fallback。
 func TestResolveRoot(t *testing.T) {
-	projectRoot := filepath.FromSlash("/tmp/project")
+	// 用真实临时目录当项目根：Windows 上没有盘符的 "/tmp/project" 会被 filepath.Abs
+	// 补成当前盘符（D:\tmp\project），断言就失去意义了。
+	projectRoot := t.TempDir()
+	absoluteRoot := filepath.Join(t.TempDir(), "pages")
 
 	if got, err := resolveRoot(projectRoot, "pages", "."); err != nil || got != filepath.Join(projectRoot, "pages") {
 		t.Fatalf("相对路径解析 = %q（err=%v），期望 %q", got, err, filepath.Join(projectRoot, "pages"))
 	}
-	if got, err := resolveRoot(projectRoot, filepath.FromSlash("/abs/pages"), "."); err != nil || got != filepath.FromSlash("/abs/pages") {
-		t.Fatalf("绝对路径应原样使用，实际 %q（err=%v）", got, err)
+	if got, err := resolveRoot(projectRoot, absoluteRoot, "."); err != nil || got != absoluteRoot {
+		t.Fatalf("绝对路径应原样使用，实际 %q（err=%v），期望 %q", got, err, absoluteRoot)
 	}
 	if got, err := resolveRoot(projectRoot, "", "."); err != nil || got != projectRoot {
 		t.Fatalf("空值应使用 fallback，实际 %q（err=%v）", got, err)

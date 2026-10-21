@@ -3,6 +3,7 @@ package main
 import (
 	"log/slog"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"syscall"
@@ -165,10 +166,17 @@ func portOf(t *testing.T, addr string) int {
 	return port
 }
 
-// TestIsAddressInUse 覆盖占用判断只认 EADDRINUSE。
+// TestIsAddressInUse 覆盖占用判断：Unix 的 EADDRINUSE、Windows 的真实 WSA 错误码都要认，
+// 其它错误不能被当成端口占用（否则端口回退会掩盖真正的失败原因）。
 func TestIsAddressInUse(t *testing.T) {
 	if !isAddressInUse(&net.OpError{Err: &net.OpError{Err: syscall.EADDRINUSE}}) {
 		t.Fatal("包装过的 EADDRINUSE 应被识别")
+	}
+	// Windows 上 net.Listen 返回的是真实 WSA 错误码，与 syscall.EADDRINUSE 不相等；
+	// 这里在任意平台上都按数值走同一条分支，因此这条断言同时覆盖了 Windows 的路径。
+	wsaErr := &os.SyscallError{Syscall: "bind", Err: syscall.Errno(wsaEADDRINUSE)}
+	if !isAddressInUse(wsaErr) {
+		t.Fatalf("Windows 的 WSA 错误码 %d 应被识别为端口占用", wsaEADDRINUSE)
 	}
 	if isAddressInUse(&net.OpError{Err: syscall.EACCES}) {
 		t.Fatal("其它错误不应被当成端口占用")

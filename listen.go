@@ -71,7 +71,21 @@ func nextPort(addr string, step int) (string, bool) {
 	return net.JoinHostPort(host, strconv.Itoa(port+step)), true
 }
 
+// wsaEADDRINUSE 是 Windows 上「地址已被占用」的真实错误码。
+//
+// 注意：Windows 的 syscall.EADDRINUSE 是 Go 自己发明的占位值（APPLICATION_ERROR 区间），
+// 与运行时真正返回的 WSA 错误码（10048）并不相等，所以 errors.Is 在 Windows 上不会命中
+// （CI 的 windows 矩阵就是这么暴露出来的）。这里再按数值兜一层，保证两个平台行为一致。
+const wsaEADDRINUSE = 10048
+
 // isAddressInUse 判断错误是否为「地址已被占用」；其它错误不该被端口回退掩盖。
 func isAddressInUse(err error) bool {
-	return errors.Is(err, syscall.EADDRINUSE)
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return uintptr(errno) == wsaEADDRINUSE
+	}
+	return false
 }
