@@ -1,6 +1,7 @@
 # 生成静态站
 
 这一篇讲 `goweb gen`（别名 `goweb build`，两者等价）的产物路径映射、拷贝规则与清空护栏。
+想在不产生产物的前提下把同样的检查跑一遍（外加站内链接检查），用 `goweb check`。
 
 ```bash
 goweb gen                          # 产出到 dist/

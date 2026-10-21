@@ -14,15 +14,23 @@ go test -run TestE2E -v ./... # 只看端到端
 go test -short -cover ./...   # 覆盖率
 ```
 
+命名约定：**大写开头的标识符表示「站点模型 API」**（`Site`/`LoadSite`/`Generate`/`Resolve`…），
+小写的是内部工具（`newHandler`/`servableFile`/`skipInWalk`…）。整个仓库是单个 `package main`，
+导出与否不影响可用性，这套大小写只是用来标示「这是对外的概念模型还是实现细节」；例外是
+`fileConfig` 的字段必须大写（yaml.v3 要求）。
+
 源码结构（`package main`，扁平分层，不做过度抽象）：
 
 | 文件 | 职责 |
 | --- | --- |
 | `main.go` | 子命令与参数分发 |
 | `config.go` | `.goweb.yml` 加载、项目根发现与 `flag > 配置 > 默认` 的取值规则 |
+| `init.go` | `init` 子命令：默认配置模板（键集合由测试与 `fileConfig` 对齐）与覆盖保护 |
+| `color.go` | 终端日志的 status 上色（仅终端、遵循 NO_COLOR）与状态码配色 |
+| `links.go` | `check` 的站内链接校验：收集 href/src/srcset，按 `urlIsPublished` 判断目标是否会出现在产物里 |
 | `site.go` | 三个根与项目根解析、页面发现、模板命名空间、`data.json` 加载、URL 路由解析、渲染 |
 | `serve.go` | HTTP 处理、访问日志、fsnotify 防抖重载 |
-| `gen.go` | 静态产物落盘、资源按所属根映射、产物路径冲突检测、清空护栏 |
+| `gen.go` | 静态产物落盘（`generateRun` 同时支撑生成与 `check` 校验模式）、资源按所属根映射、产物路径冲突检测、清空护栏 |
 | `gitignore.go` | `.gitignore` 子集解析与匹配（`**` 交给 doublestar，语义用真实 git 逐条对拍验证） |
 | `fingerprint.go` | 页面里站内资源引用的 `?v=<内容哈希>` 自动改写 |
 | `funcs.go` | 内置模板函数（`asset`/`default`/`fail`/`dict`/文本工具/模式与时间）与其加载上下文 |
@@ -33,7 +41,7 @@ go test -short -cover ./...   # 覆盖率
 
 | 测试 | 边界 | 覆盖内容 |
 | --- | --- | --- |
-| `site_test.go` | `LoadSite` / `Reload` / `Render` / `Resolve` / `WatchPaths` | 页面发现与忽略规则、try_files 三候选顺序与路径归一化、data.json 语义、坏模板保留上一版、并发渲染与重载 |
+| `site_test.go` | `LoadSite` / `Reload` / `Render` / `Resolve` / `WatchPaths` / `ignoredPath` | 页面发现与忽略规则、try_files 三候选顺序与路径归一化、data.json 语义、坏模板保留上一版、并发渲染与重载 |
 | `roots_test.go` | `LoadSite`（三根）与 CLI 配置链路 | 三个根与项目根解析（含向上查找、`--config` 显式路径、模板根在项目根之外）、产物映射与冲突报错、忽略规则只作用于 gen、`.goweb.yml` 优先级与未知字段 |
 | `gitignore_test.go` | `ignoreMatcher` | 模式子集语义，并与真实 `git check-ignore` 在同一批路径上逐条对拍 |
 | `fingerprint_test.go` | `fingerprintHTML` | 属性白名单、跳过规则（外链/`data:`/页面/模板/已带查询串）、相对路径、`srcset`、无改动时逐字节保真、与 `{{asset}}` 同哈希 |
@@ -43,7 +51,10 @@ go test -short -cover ./...   # 覆盖率
 | `serve_test.go` | `newHandler` / `watchSite` / `selfOutputFiles` | 状态码与响应头、访问日志、渲染失败回 500、fsnotify 重载与失败韧性、新增文件被发现、热重载注入范围与广播时机 |
 | `livereload_test.go` | `liveReloadHub` / `injectLiveReload` | 脚本注入位置（`</body>` 前/追加/大小写）、订阅与注销、慢客户端不阻塞广播 |
 | `open_test.go` | `browserURL` / `browserCommand` / `openInBrowser` | 监听地址到浏览器地址的推导（通配→localhost、IPv6 方括号）、三平台命令与 `GOWEB_OPEN_COMMAND` 覆盖、打开失败只记日志不影响服务 |
-| `main_test.go` | cobra 命令树 | 参数默认值与短选项、公共参数前置、错误前缀与 usage、`--version` 注入 |
+| `color_test.go` | `colorizeStatus` / `colorWriter` / `wantColorLogs` | 2xx 不上色、3xx/4xx/5xx 配色、分片写入的整行处理、非终端与 NO_COLOR 时不上色、访问日志不含 duration |
+| `check_test.go` | `Generate`（Check）/ `urlIsPublished` | 不落盘且不动已有产物、问题汇总（渲染失败+路径冲突+坏链接一次列全）、`--links=false`、链接指向被忽略目标、URL 与产物路径一致性的判定 |
+| `init_test.go` | `runInit` / `defaultConfigTemplate` | 生成内容与模板一致、键集合与 `fileConfig` 对齐、`addr` 只作注释、不改变默认行为、已存在报错且不改文件、`--force`、向上查找不生成嵌套配置、`--config` 指定路径、init 后能直接 build |
+| `main_test.go` | cobra 命令树 | 参数默认值与短选项、公共参数前置、错误前缀与 usage、`--version` 注入、`dev`/`build` 别名等价 |
 | `e2e_test.go` | **真实二进制 + 真实 HTTP** | 编译 goweb → 跑 `gen`（产物清单、幂等、护栏退出码、坏数据失败、产物不含热重载脚本、`pages/ + templates/ + static/` 三根布局与 `.goweb.yml` 驱动）与 `serve`（全部 URL 语义、405/404、缓存头、SSE 推送刷新事件、`--livereload=false`、坏模板韧性、被忽略文件本地仍可见、`--version`/`help`/`completion`） |
 | `e2e_test.go`（自动开浏览器） | 真实 `serve` + `GOWEB_OPEN_COMMAND` | 现场编译一个「把收到的参数写进文件」的记录器程序当打开命令（跨平台，不弹窗），验证 serve 确实把**真实监听地址**交给它，且 `--open=false` 完全不调用 |
 

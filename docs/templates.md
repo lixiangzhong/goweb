@@ -47,7 +47,7 @@
 | 值 | 行为 |
 | --- | --- |
 | `auto`（默认） | `serve` 用 `dev`、`gen` 用 `prod` |
-| `dev` / `prod` | 显式指定，两个子命令都接受 |
+| `dev` / `prod` | 显式指定；`serve`/`dev` 与 `gen`/`build` 都接受（`check` 按产出方向用 `auto` 的默认值，即 `prod`） |
 
 典型用途是「统计脚本只进线上产物」：`{{if prod}}<script src="/stat.js"></script>{{end}}`。想在本地预览生产产物：`goweb serve --livereload=false --mode prod`（关掉注入才是与 `gen` 逐字节一致的 HTML）。
 

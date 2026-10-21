@@ -3,7 +3,10 @@
 这一篇讲命令行用法、`.goweb.yml` 配置文件与全部参数的默认值和适用范围。
 
 ```bash
+goweb init                                     # 生成默认配置文件 .goweb.yml
+goweb check                                    # 只校验不产出（跑 gen 的检查 + 站内链接）
 goweb [serve] [--addr :8080] [--dir pages] [--template templates] [--assets .]
+goweb dev                                      # serve 的别名，完全等价
 goweb gen     [--dir pages] [--out dist] [--clean=true]
 goweb build                                    # gen 的别名，完全等价
 goweb completion bash|zsh|fish|powershell      # 生成 shell 补全脚本
@@ -11,7 +14,33 @@ goweb help [command]
 goweb --version
 ```
 
-`goweb` 不带子命令时等价于 `goweb serve`；`goweb build` 等价于 `goweb gen`（别名，参数与行为完全一致，`--mode auto` 下同样是 `prod`）；`--dir` / `--template` / `--assets` / `--config` / `--mode` / `--fingerprint` / `--build-time` 是公共参数，写在子命令前后都可以（`goweb --dir pages gen` 与 `goweb gen --dir pages` 等价）。
+`goweb` 不带子命令时等价于 `goweb serve`；`goweb dev` 等价于 `goweb serve`、`goweb build` 等价于 `goweb gen`（都是别名，参数与行为完全一致，`build` 在 `--mode auto` 下同样是 `prod`）；`--dir` / `--template` / `--assets` / `--config` / `--mode` / `--fingerprint` / `--build-time` 是公共参数，写在子命令前后都可以（`goweb --dir pages gen` 与 `goweb gen --dir pages` 等价）。
+
+## 校验：`goweb check`
+
+```bash
+goweb check                  # 跑完整校验
+goweb check --links=false    # 不查站内链接
+```
+
+- 跑与 `gen` **完全相同**的检查：模板语法与 `data.json`、每页渲染（含压缩）、忽略规则、产物路径冲突、产物目录护栏；另外默认检查渲染结果里的**站内链接**。
+- **不写、不清空任何产物**：产物目录既不创建也不删除（`--out` 只用于「哪些目录被排除」和护栏判断）。
+- **问题一次列全**再以非零码退出（不是遇到第一个就停），方便一轮改完。
+- 链接检查按 `serve` 完全相同的 `try_files` 规则试算，并额外要求**目标会进产物且 URL 与产物路径一致**，因此能抓出「本地能开、线上没有」的链接：多写了页面根那一层（`/pages/x.html`）、指向目录（`/static`）、指向被忽略的文件、指向不存在的文件。外链、`data:`、`mailto:`、锚点不检查。
+- 同一个坏 URL 在多个页面出现时合并成一条（附页面清单），避免共享模板的问题刷屏。
+
+## 生成配置文件：`goweb init`
+
+```bash
+goweb init                              # 在当前目录生成 .goweb.yml
+goweb init --force                      # 覆盖已存在的配置
+goweb init --config conf/goweb.yml      # 生成到别处
+```
+
+- 生成的内容是**全部 13 个键的当前默认值**，每个键上方一行注释；出现这个文件**不会改变任何默认行为**（可对照下文「配置文件」小节逐项核对）。
+- 已存在时报错退出、不碰你的文件；要覆盖必须显式 `--force`。
+- 从子目录运行且项目根已有配置时报错（避免生成第二份嵌套配置，出现两个真相源）。
+- **唯一的例外**：`addr` 只以注释形式列出。显式写 `addr`（哪怕值就是 `:8080`）会被视为「我就要这个端口」，从而关掉「默认端口被占用时自动递增」——生成的配置不该悄悄改变这个行为。
 
 ## 配置文件 `.goweb.yml`
 
@@ -50,8 +79,37 @@ ignore:               # 额外忽略模式（与 .gitignore 同语法，只作�
 | `--fingerprint` | — | 全部 | `true` | 自动给页面里的站内资源引用补 `?v=<内容哈希>`；`--fingerprint=false` 关闭 |
 | `--mode` | — | 全部 | `auto` | 渲染模式：`auto`（serve=dev、gen=prod）、`dev`、`prod` |
 | `--build-time` | — | 全部 | 空（取站点最新修改时间） | 模板里的构建时间，RFC3339 或 `2006-01-02` |
+| `--force` | — | init | `false` | 覆盖已存在的配置文件 |
+| `--links` | — | check | `true` | 检查渲染结果里的站内链接；`--links=false` 关闭 |
 | `--version` | `-v` | 根命令（`goweb --version`） | — | 打印版本号（`dev`，除非构建时用 `-ldflags` 注入） |
 | `--help` | `-h` | 全部 | — | 查看帮助，如 `goweb gen --help` |
+
+### 日志格式
+
+slog 文本格式、键值对，时间戳固定为 `time.DateTime`（`2006-01-02 15:04:05`，不含毫秒与时区偏移，含空格所以会被引号包起来）：
+
+```console
+time="2026-10-21 14:07:44" level=INFO msg="goweb 开发服务器已启动" addr=127.0.0.1:8080 mode=dev livereload=true open=true
+time="2026-10-21 14:07:45" level=INFO msg=处理请求 method=GET path=/ status=200
+time="2026-10-21 14:07:46" level=INFO msg=处理请求 method=GET path=/missing status=404
+```
+
+访问日志只留 `method`/`path`/`status`（耗时交给浏览器 devtools 或压测工具，不占终端宽度）。
+
+**终端里给非 2xx 的状态码上色**（只影响显示，不改变输出内容）：
+
+| 状态码 | 颜色 |
+| --- | --- |
+| 2xx | 不上色（正常请求占大多数，全上色反而看不清异常） |
+| 3xx | 青 |
+| 4xx | 黄 |
+| 5xx | 红 |
+
+- 只在**输出是终端**时上色：重定向到文件、管道给 `less`/`grep` 时不会混入转义序列（判断依据是 stdout/stderr 是否为字符设备）。
+- 设置了 `NO_COLOR` 环境变量（约定见 no-color.org）时一律不上色。
+- 想要纯文本日志又不想改环境变量时，直接重定向即可：`goweb dev > build.log 2>&1`。
+
+> 注意：日志**字段**里的构建时间（`buildTime=`）仍是带时区的 RFC3339（它同时是 `--build-time` 的输入与产物里的时间值），与时间戳格式是两回事。
 
 ### 监听端口与自动递增
 

@@ -7,9 +7,11 @@
 [![License](https://img.shields.io/github/license/lixiangzhong/goweb)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#贡献)
 
-`goweb` 是一个 Go 写的单二进制静态站工具，只有两个子命令：
+`goweb` 是一个 Go 写的单二进制静态站工具，只有四个子命令：
 
-- **`goweb serve`** —— 在站点目录起开发服务器。产物与源码一一对应，开发服务器不做任何尾斜杠/扩展名重定向，改完模板或数据自动重新加载。
+- **`goweb init`** —— 生成默认配置文件 `.goweb.yml`（每个键都写出默认值并带注释）。
+- **`goweb check`** —— 只校验不产出：跑 `gen` 的全套检查（模板、渲染、忽略规则、产物路径冲突），外加渲染结果里的站内链接检查，问题一次列全。
+- **`goweb serve`** —— 在站点目录起开发服务器（别名 `goweb dev`，两者完全等价）。产物与源码一一对应，开发服务器不做任何尾斜杠/扩展名重定向，改完模板或数据自动重新加载。
 - **`goweb gen`** —— 把页面渲染成纯静态站，产出 `dist/`，拷到任何静态托管即可上线（别名 `goweb build`，两者完全等价）。
 
 不需要 npm、webpack、vite，只依赖标准库 + [cobra](https://github.com/spf13/cobra) + [fsnotify](https://github.com/fsnotify/fsnotify) + [x/net/html](https://pkg.go.dev/golang.org/x/net/html) + [doublestar](https://github.com/bmatcuk/doublestar) + [yaml.v3](https://pkg.go.dev/go.yaml.in/yaml/v3)；配置文件可选，不写也能跑。
@@ -23,8 +25,10 @@
 - **站点级数据**：`templates/data.json` 提供站名、备案号、导航等共享变量，页面与局部模板都能取。
 - **保存即可见**：页面、模板、`data.json` 或静态资源变更后自动重载，并通过 SSE 让浏览器自动刷新；改到一半的坏模板不会让服务挂掉，也不会触发刷新。
 - **端口自动避让**：没显式指定端口时，`:8080` 被占用会依次试 `:8081…:8089`，日志里说明实际地址；显式指定端口则保持快速失败。
+- **终端里的日志看得清**：时间戳是 `2006-01-02 15:04:05`，访问日志只留 `method`/`path`/`status`，非 2xx 的状态码在终端里按 3xx 青／4xx 黄／5xx 红上色（重定向或管道时自动不上色，`NO_COLOR` 可关闭）。
 - **启动即开浏览器**：`goweb serve` 监听成功后自动用系统默认浏览器打开站点（`--open=false` 关闭；CI/SSH 里打不开只记日志，不影响服务）。
 - **缓存失效自动做**：页面里写普通的 `/static/css/site.css`，`gen` 与 `serve` 都会自动补上 `?v=<内容哈希>`；外链、`data:`、已带查询串的写法一律不动（`--fingerprint=false` 可关闭）。
+- **交付前先自查**：`goweb check` 跑 `gen` 的全套检查（模板、渲染、忽略规则、产物路径冲突）外加站内链接检查，**不写任何产物**，问题一次列全。
 - **一条命令静态化**：`goweb gen` 原地产出 `dist/`，其余文件按各自所属的根拷贝；默认压缩 HTML/CSS/JS/JSON/SVG/XML（只去空白与注释，不改 JS 变量名，`--minify=false` 关闭）。
 - **危险操作有护栏**：清空产物目录前会拦截项目根、页面/模板/资源三个根本身及其父目录，也不会把用户主目录当产物目录。
 - **快速失败**：任一页面渲染失败即整体失败、非零退出，绝不把半成品产物当成成功发布。
@@ -70,8 +74,11 @@ Windows 说明：
 
 ```bash
 mkdir mysite && cd mysite
+goweb init           # 可选：生成带注释的 .goweb.yml（不生成也不影响任何功能）
 # 写你的页面、模板与静态资源……
 goweb                # 浏览器打开 http://localhost:8080/（自动开浏览器，--open=false 关闭）
+goweb dev            # 与 goweb serve 等价（别名）
+goweb check          # 只校验不产出：链接、模板、产物路径冲突一次查完
 goweb gen            # 产出 dist/，直接部署（别名 goweb build 等价）
 ```
 
@@ -148,7 +155,7 @@ ignore:               # 额外的忽略模式，与 .gitignore 叠加
 
 ```console
 $ goweb gen
-time=2026-10-21T10:06:47+08:00 level=INFO msg=静态站已生成 out=/Users/me/mysite/dist pages=2 assets=1 data=/Users/me/mysite/templates/data.json mode=prod buildTime=2026-10-21T10:06:46+08:00 fingerprint=true
+time="2026-10-21 10:06:47" level=INFO msg=静态站已生成 out=/Users/me/mysite/dist pages=2 assets=1 data=/Users/me/mysite/templates/data.json mode=prod buildTime=2026-10-21T10:06:46+08:00 fingerprint=true
 
 $ find dist -type f
 dist/about.html
