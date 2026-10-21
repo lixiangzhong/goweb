@@ -17,15 +17,21 @@ import (
 type GenOptions struct {
 	// Out 是产物目录，相对路径按当前工作目录解析。
 	Out string
-	// Clean 表示生成前清空产物目录。
+	// Clean 表示生成前清空产物目录（校验模式不做任何清理）。
 	Clean bool
 	// Minify 表示压缩页面与可压缩的资源（HTML/CSS/JS/JSON/SVG/XML）；其余文件逐字节拷贝。
 	Minify bool
+	// Check 为真时进入校验模式：不写、不清空任何产物，并尽量收集全部问题
+	// （页面渲染失败、产物路径冲突、护栏错误）而不是遇到第一个就返回。check 子命令用它。
+	Check bool
+	// OnPage 在每一页渲染（含压缩）完成后调用，用于检查渲染结果（例如站内链接）。
+	// 返回的错误按当前模式处理：校验模式收集、生成模式立即失败。可为 nil。
+	OnPage func(name string, body []byte) error
 	// Logger 用于记录跳过项；为空时静默。
 	Logger *slog.Logger
 }
 
-// GenResult 汇总一次生成的产物数量。
+// GenResult 汇总一次生成/校验的产物数量。
 type GenResult struct {
 	// Out 是产物目录的绝对路径。
 	Out    string
@@ -35,77 +41,157 @@ type GenResult struct {
 
 // Generate 把站点渲染为纯静态产物：页面按目录式落盘，其余文件原样拷贝。
 // 开启 Minify 时页面与可压缩资源会被压缩（只去空白与注释，不改 JS 变量名）。
-// 任一步失败即整体失败，不做静默跳过，避免半成品产物被当成成功发布。
+// 默认任一步失败即整体失败，不做静默跳过，避免半成品产物被当成成功发布；
+// Check 为真时改为「不落盘 + 收集全部问题」。
 func Generate(site *Site, opts GenOptions) (GenResult, error) {
 	var result GenResult
-
-	// 压缩器按需构造一次：关闭压缩时为 nil，代码路径只有「原样拷贝」。
-	var minifier *minify.M
-	if opts.Minify {
-		minifier = newMinifier()
-	}
 
 	out, err := filepath.Abs(opts.Out)
 	if err != nil {
 		return result, fmt.Errorf("解析产物目录 %q: %w", opts.Out, err)
 	}
-	if err := guardOutDir(site, out); err != nil {
-		return result, err
-	}
 	result.Out = out
 
-	if opts.Clean {
-		if err := cleanDir(out); err != nil {
-			return result, err
+	run := &generateRun{
+		site:      site,
+		out:       out,
+		logger:    opts.logger(),
+		check:     opts.Check,
+		onPage:    opts.OnPage,
+		artifacts: make(map[string]string),
+	}
+	// 压缩器按需构造一次：关闭压缩时为 nil，代码路径只有「原样拷贝」。
+	if opts.Minify {
+		run.minifier = newMinifier()
+	}
+
+	if err := guardOutDir(site, out); err != nil {
+		if stop := run.record(err); stop != nil {
+			return result, stop
 		}
 	}
-	if err := os.MkdirAll(out, 0o755); err != nil {
-		return result, fmt.Errorf("创建产物目录 %q: %w", out, err)
+	if !opts.Check {
+		if opts.Clean {
+			if err := cleanDir(out); err != nil {
+				return result, err
+			}
+		}
+		if err := os.MkdirAll(out, 0o755); err != nil {
+			return result, fmt.Errorf("创建产物目录 %q: %w", out, err)
+		}
 	}
 
-	logger := opts.logger()
+	run.writePages()
+	if run.fatal != nil {
+		return result, run.fatal
+	}
+	run.copyAssets()
+	if run.fatal != nil {
+		return result, run.fatal
+	}
 
-	// artifacts 记录产物路径 -> 来源，用于发现页面与资源撞同一路径。
-	artifacts := make(map[string]string)
+	result.Pages, result.Assets = run.pages, run.assets
+	if len(run.problems) > 0 {
+		return result, errors.Join(run.problems...)
+	}
+	return result, nil
+}
 
-	for _, name := range site.Pages() {
-		source := site.pageFile(name)
-		// 忽略规则只作用于 gen：被忽略的页面本地可见（serve 照常），但不进产物。
-		if source != "" && site.ignoredForOutput(source, false) {
-			logger.Info("跳过被忽略的页面", "page", name, "source", source)
+// generateRun 持有一次生成/校验的共享状态，让「写页面」与「拷资源」两条路径共用同一套
+// 冲突登记与问题收集逻辑，只在真正落盘的那几行分叉。
+type generateRun struct {
+	site      *Site
+	out       string
+	minifier  *minify.M
+	logger    *slog.Logger
+	check     bool
+	onPage    func(name string, body []byte) error
+	artifacts map[string]string
+
+	problems []error
+	// fatal 是生成模式下的第一个错误：记下来让调用方尽快退出。
+	fatal  error
+	pages  int
+	assets int
+}
+
+// record 登记一个问题。校验模式收集后继续（返回 nil），生成模式记下致命错误并返回它，
+// 让调用方立即停止——生成不能产出半成品，校验则要一次把问题都列出来。
+func (r *generateRun) record(err error) error {
+	r.problems = append(r.problems, err)
+	if r.check {
+		return nil
+	}
+	r.fatal = err
+	return err
+}
+
+// writePages 渲染全部页面：生成模式落盘，校验模式只渲染并交给 OnPage 检查。
+func (r *generateRun) writePages() {
+	for _, name := range r.site.Pages() {
+		source := r.site.pageFile(name)
+		// 忽略规则只作用于产出：被忽略的页面本地可见（serve 照常），但不进产物。
+		if source != "" && r.site.ignoredForOutput(source, false) {
+			r.logger.Info("跳过被忽略的页面", "page", name, "source", source)
 			continue
 		}
-		body, err := site.Render(name)
+		body, err := r.renderPage(name)
 		if err != nil {
-			return result, fmt.Errorf("渲染页面 %s: %w", name, err)
-		}
-		// 压缩在渲染与资源版本号改写之后进行：先保证 URL 已经定稿，再去空白与注释。
-		if minifier != nil {
-			if body, err = minifyBytes(minifier, mediaTypeHTML, body); err != nil {
-				return result, fmt.Errorf("压缩页面 %s: %w", name, err)
+			if stop := r.record(err); stop != nil {
+				return
 			}
+			continue
 		}
 		// 页面产物跟随页面根：about.html -> dist/about.html。
 		rel := filepath.FromSlash(name + pageExt)
-		target := filepath.Join(out, rel)
-		if err := recordArtifact(artifacts, rel, source); err != nil {
-			return result, err
+		if err := recordArtifact(r.artifacts, rel, source); err != nil {
+			if stop := r.record(err); stop != nil {
+				return
+			}
+			continue
 		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return result, fmt.Errorf("创建页面目录 %q: %w", filepath.Dir(target), err)
+		if !r.check {
+			if err := writePageFile(r.out, rel, body); err != nil {
+				if stop := r.record(fmt.Errorf("页面 %s: %w", name, err)); stop != nil {
+					return
+				}
+				continue
+			}
 		}
-		if err := os.WriteFile(target, body, 0o644); err != nil {
-			return result, fmt.Errorf("写入页面 %q: %w", target, err)
-		}
-		result.Pages++
+		r.pages++
 	}
+}
 
-	assets, err := copyAssets(site, out, artifacts, minifier, logger)
+// renderPage 渲染单页：执行模板 → 压缩（开启时）→ 交给 OnPage 检查渲染结果。
+func (r *generateRun) renderPage(name string) ([]byte, error) {
+	body, err := r.site.Render(name)
 	if err != nil {
-		return result, err
+		return nil, fmt.Errorf("渲染页面 %s: %w", name, err)
 	}
-	result.Assets = assets
-	return result, nil
+	// 压缩在渲染与资源版本号改写之后进行：先保证 URL 已经定稿，再去空白与注释。
+	if r.minifier != nil {
+		if body, err = minifyBytes(r.minifier, mediaTypeHTML, body); err != nil {
+			return nil, fmt.Errorf("压缩页面 %s: %w", name, err)
+		}
+	}
+	if r.onPage != nil {
+		if err := r.onPage(name, body); err != nil {
+			return nil, fmt.Errorf("检查页面 %s: %w", name, err)
+		}
+	}
+	return body, nil
+}
+
+// writePageFile 把一个页面写进产物目录。
+func writePageFile(out, rel string, body []byte) error {
+	target := filepath.Join(out, rel)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("创建页面目录 %q: %w", filepath.Dir(target), err)
+	}
+	if err := os.WriteFile(target, body, 0o644); err != nil {
+		return fmt.Errorf("写入页面 %q: %w", target, err)
+	}
+	return nil
 }
 
 // recordArtifact 登记一个产物路径，撞车时直接报错（列出两个来源）。
@@ -191,11 +277,10 @@ func cleanDir(dir string) error {
 // 产物路径按「所属根」决定：位于页面根内的文件按页面根相对路径
 // （这样页面里的相对引用才对得上），其余按资源根相对路径。
 // 被忽略规则排除的文件不进产物，并记录日志。
-// minifier 非空时，按扩展名可压缩的文件（CSS/JS/JSON/SVG/XML）会压缩后写出。
-func copyAssets(site *Site, out string, artifacts map[string]string, minifier *minify.M, logger *slog.Logger) (int, error) {
-	assetsRoot := site.AssetsRoot()
-	outInAssets := withinDir(assetsRoot, out) || out == assetsRoot
-	count := 0
+// 生成模式下按扩展名可压缩的文件（CSS/JS/JSON/SVG/XML）会压缩后写出；校验模式只检查不写。
+func (r *generateRun) copyAssets() {
+	assetsRoot := r.site.AssetsRoot()
+	outInAssets := withinDir(assetsRoot, r.out) || r.out == assetsRoot
 
 	err := filepath.WalkDir(assetsRoot, func(filePath string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -204,77 +289,106 @@ func copyAssets(site *Site, out string, artifacts map[string]string, minifier *m
 		if filePath == assetsRoot {
 			return nil
 		}
-		if site.skipPath(filePath, entry.IsDir()) {
-			if entry.IsDir() {
+		if skip, skipDir := r.skipAssetEntry(filePath, entry, outInAssets); skip {
+			if skipDir {
 				return fs.SkipDir
 			}
 			return nil
 		}
-		// 产物目录本身不参与拷贝（它在资源根里时）。
-		if outInAssets && withinDir(out, filePath) {
-			if entry.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		// 模板根的内容不进产物。
-		if site.WithinTemplateDir(filePath) {
-			if entry.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-
-		rel, err := filepath.Rel(assetsRoot, filePath)
-		if err != nil {
-			return fmt.Errorf("计算相对路径 %s: %w", filePath, err)
-		}
-
 		if entry.IsDir() {
 			return nil
 		}
-
-		// 页面根里的 html 已由模板渲染产出，不再当资源拷贝；
-		// 页面根外的 html 是普通文件，照原样拷贝。
-		if withinDir(site.PagesRoot(), filePath) {
-			if strings.EqualFold(filepath.Ext(filePath), pageExt) {
-				return nil
-			}
-			// 页面根内的非 html 文件按页面根映射，保证与页面 URL 一致。
-			if pageRel, err := filepath.Rel(site.PagesRoot(), filePath); err == nil {
-				rel = pageRel
-			}
-		}
-
-		if site.ignoredForOutput(filePath, false) {
-			logger.Info("跳过被忽略的文件", "file", filepath.ToSlash(rel))
-			return nil
-		}
-
-		if entry.Type()&fs.ModeSymlink != 0 {
-			isDir, err := symlinkToDir(filePath)
-			if err != nil {
-				return err
-			}
-			if isDir {
-				logger.Warn("跳过指向目录的符号链接", "path", filepath.ToSlash(rel))
-				return nil
-			}
-		}
-
-		if err := recordArtifact(artifacts, rel, filePath); err != nil {
-			return err
-		}
-		if err := copyFile(filePath, filepath.Join(out, rel), minifier, minifyMediaType(filePath)); err != nil {
-			return err
-		}
-		count++
-		return nil
+		return r.copyAsset(filePath, entry)
 	})
 	if err != nil {
-		return count, err
+		// 遍历本身出错（权限、I/O）：生成模式立即失败，校验模式记下继续。
+		_ = r.record(err)
 	}
-	return count, nil
+}
+
+// skipAssetEntry 判断资源遍历是否跳过该条目：扫描忽略项（隐藏项、node_modules、排除目录）、
+// 产物目录本身、模板根。skipDir 表示连整个目录一起跳过。
+func (r *generateRun) skipAssetEntry(filePath string, entry fs.DirEntry, outInAssets bool) (skip, skipDir bool) {
+	if r.site.skipInWalk(filePath) {
+		return true, entry.IsDir()
+	}
+	// 产物目录本身不参与拷贝（它在资源根里时）。
+	if outInAssets && withinDir(r.out, filePath) {
+		return true, entry.IsDir()
+	}
+	// 模板根的内容不进产物。
+	if r.site.withinTemplateRoot(filePath) {
+		return true, entry.IsDir()
+	}
+	return false, false
+}
+
+// copyAsset 处理单个文件：算出产物路径 → 过滤（页面产物/忽略项/软链接）→ 计数，
+// 生成模式再拷贝或压缩写出。
+func (r *generateRun) copyAsset(filePath string, entry fs.DirEntry) error {
+	rel, skipPageHTML, err := assetRelPath(r.site, filePath)
+	if err != nil {
+		if stop := r.record(err); stop != nil {
+			return stop
+		}
+		return nil
+	}
+	if skipPageHTML {
+		return nil
+	}
+	if r.site.ignoredForOutput(filePath, false) {
+		r.logger.Info("跳过被忽略的文件", "file", filepath.ToSlash(rel))
+		return nil
+	}
+	if entry.Type()&fs.ModeSymlink != 0 {
+		isDir, err := symlinkToDir(filePath)
+		if err != nil {
+			if stop := r.record(err); stop != nil {
+				return stop
+			}
+			return nil
+		}
+		if isDir {
+			r.logger.Warn("跳过指向目录的符号链接", "path", filepath.ToSlash(rel))
+			return nil
+		}
+	}
+	if err := recordArtifact(r.artifacts, rel, filePath); err != nil {
+		if stop := r.record(err); stop != nil {
+			return stop
+		}
+		return nil
+	}
+	if !r.check {
+		if err := copyFile(filePath, filepath.Join(r.out, rel), r.minifier, minifyMediaType(filePath)); err != nil {
+			if stop := r.record(fmt.Errorf("资源 %s: %w", filepath.ToSlash(rel), err)); stop != nil {
+				return stop
+			}
+			return nil
+		}
+	}
+	r.assets++
+	return nil
+}
+
+// assetRelPath 给出资源文件在产物里的相对路径：
+// 页面根内的文件按页面根映射（保证与页面 URL 一致），其余按资源根映射。
+// 页面根里的 html 由模板渲染产出，此时 skip 为真。
+func assetRelPath(site *Site, filePath string) (rel string, skip bool, err error) {
+	rel, err = filepath.Rel(site.AssetsRoot(), filePath)
+	if err != nil {
+		return "", false, fmt.Errorf("计算相对路径 %s: %w", filePath, err)
+	}
+	if !withinDir(site.PagesRoot(), filePath) {
+		return rel, false, nil
+	}
+	if strings.EqualFold(filepath.Ext(filePath), pageExt) {
+		return "", true, nil
+	}
+	if pageRel, pageErr := filepath.Rel(site.PagesRoot(), filePath); pageErr == nil {
+		rel = pageRel
+	}
+	return rel, false, nil
 }
 
 // symlinkToDir 判断符号链接是否指向目录。
@@ -310,6 +424,8 @@ func copyFile(src, dst string, minifier *minify.M, mediaType string) error {
 	if minifier != nil && mediaType != "" {
 		if err := minifier.Minify(mediaType, out, in); err != nil {
 			out.Close()
+			// 压缩是流式写入，失败会留下半个文件；删掉它，别把坏文件留在产物里。
+			_ = os.Remove(dst)
 			return fmt.Errorf("压缩 %s: %w", src, err)
 		}
 	} else if _, err := io.Copy(out, in); err != nil {

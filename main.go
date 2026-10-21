@@ -49,6 +49,7 @@ type globalOptions struct {
 	fingerprint bool
 }
 
+// main 只负责退出码：命令树、错误信息与 usage 都由 cobra 处理。
 func main() {
 	// 错误信息与 usage 由 cobra 打印（前缀 goweb:），这里只负责退出码。
 	if err := newRootCommand().Execute(); err != nil {
@@ -61,7 +62,7 @@ func newRootCommand() *cobra.Command {
 	globals := &globalOptions{}
 	var addr string
 	var liveReload bool
-	var openBrowser bool
+	var open bool
 
 	root := &cobra.Command{
 		Use:     "goweb",
@@ -74,7 +75,7 @@ func newRootCommand() *cobra.Command {
 			// 参数已解析完成，运行期错误不再刷 usage。
 			cmd.SilenceUsage = true
 			return runServe(cmd, serveOptions{
-				addr: addr, liveReload: liveReload, open: openBrowser, globals: globals,
+				addr: addr, liveReload: liveReload, open: open, globals: globals,
 			})
 		},
 	}
@@ -83,9 +84,9 @@ func newRootCommand() *cobra.Command {
 	addGlobalFlags(root, globals)
 	root.Flags().StringVarP(&addr, "addr", "a", defaultAddr, "监听地址（根命令等价于 serve）")
 	addLiveReloadFlag(root, &liveReload)
-	addOpenFlag(root, &openBrowser)
+	addOpenFlag(root, &open)
 
-	root.AddCommand(newServeCommand(globals), newGenCommand(globals))
+	root.AddCommand(newServeCommand(globals), newGenCommand(globals), newCheckCommand(globals), newInitCommand(globals))
 	return root
 }
 
@@ -93,24 +94,25 @@ func newRootCommand() *cobra.Command {
 func newServeCommand(globals *globalOptions) *cobra.Command {
 	var addr string
 	var liveReload bool
-	var openBrowser bool
+	var open bool
 
 	cmd := &cobra.Command{
 		Use:     "serve",
-		Short:   "启动开发服务器",
-		Long:    "启动开发服务器：目录式路由 + 模板渲染 + 静态文件直出；站点文件变更后自动重载，并通过 SSE 让浏览器自动刷新。",
+		Aliases: []string{"dev"},
+		Short:   "启动开发服务器（别名：dev）",
+		Long:    "启动开发服务器：目录式路由 + 模板渲染 + 静态文件直出；站点文件变更后自动重载，并通过 SSE 让浏览器自动刷新。别名 dev 与 serve 完全等价（不带子命令时同样等价于 serve）。",
 		Example: serveExample,
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cmd.SilenceUsage = true
 			return runServe(cmd, serveOptions{
-				addr: addr, liveReload: liveReload, open: openBrowser, globals: globals,
+				addr: addr, liveReload: liveReload, open: open, globals: globals,
 			})
 		},
 	}
 	cmd.Flags().StringVarP(&addr, "addr", "a", defaultAddr, "监听地址")
 	addLiveReloadFlag(cmd, &liveReload)
-	addOpenFlag(cmd, &openBrowser)
+	addOpenFlag(cmd, &open)
 	return cmd
 }
 
@@ -137,6 +139,49 @@ func newGenCommand(globals *globalOptions) *cobra.Command {
 	cmd.Flags().BoolVarP(&clean, "clean", "c", true, "生成前清空产物目录")
 	cmd.Flags().BoolVar(&minifyOutput, "minify", true,
 		"压缩页面与 CSS/JS/JSON/SVG/XML 资源（只去空白与注释，不改 JS 变量名）；--minify=false 关闭")
+	return cmd
+}
+
+// newCheckCommand 构造 check 子命令：跑与 gen 完全相同的校验，但不写任何产物。
+func newCheckCommand(globals *globalOptions) *cobra.Command {
+	var links bool
+
+	cmd := &cobra.Command{
+		Use:   "check",
+		Short: "只校验不产出：跑 gen 的全套检查，外加站内链接检查",
+		Long: "跑与 gen 完全相同的校验但不写任何产物：模板语法与 data.json、每页渲染（含压缩）、" +
+			"忽略规则、产物路径冲突与产物目录护栏都会检查一遍，最后再把渲染结果里的站内链接" +
+			"按 URL 规则试算一遍（外链、data:、锚点不查），报出会 404 的目标。" +
+			"问题会一次全部列出再退出（非零退出码），不是遇到第一个就停。" +
+			"用 --links=false 关掉链接检查。",
+		Example: checkExample,
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cmd.SilenceUsage = true
+			return runCheck(cmd, globals, checkOptions{links: links})
+		},
+	}
+	cmd.Flags().BoolVar(&links, "links", true,
+		"检查渲染结果里的站内链接是否都能在产物里找到；--links=false 关闭")
+	return cmd
+}
+
+// newInitCommand 构造 init 子命令：生成一份带全部默认值（并逐行注释）的 .goweb.yml。
+func newInitCommand(globals *globalOptions) *cobra.Command {
+	var force bool
+
+	cmd := &cobra.Command{
+		Use:     "init",
+		Short:   "生成默认配置文件 .goweb.yml",
+		Long:    "生成默认配置文件：键名与命令行参数同名，每个键都写出当前默认值并逐行注释；出现这个文件不会改变任何默认行为。已存在时报错退出，用 --force 覆盖；用 --config <路径> 生成到别处。",
+		Example: initExample,
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cmd.SilenceUsage = true
+			return runInit(cmd, globals, initOptions{force: force})
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "覆盖已存在的配置文件")
 	return cmd
 }
 
@@ -190,17 +235,18 @@ func resolveMode(raw string, devCommand bool) (Mode, error) {
 }
 
 // parseBuildTime 解析 --build-time，留空表示由站点文件推导。
+// 接受的格式与模板 date/year 参数共用同一份清单（acceptedTimeLayouts），避免两处分叉。
 func parseBuildTime(raw string) (time.Time, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return time.Time{}, nil
 	}
-	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02"} {
+	for _, layout := range acceptedTimeLayouts {
 		if parsed, err := time.Parse(layout, trimmed); err == nil {
 			return parsed, nil
 		}
 	}
-	return time.Time{}, fmt.Errorf("--build-time 无法解析 %q（支持 RFC3339 / 2006-01-02 15:04:05 / 2006-01-02）", raw)
+	return time.Time{}, fmt.Errorf("--build-time 无法解析 %q（支持 %s）", raw, timeLayoutsHint)
 }
 
 // serveOptions 是 serve 的参数。
@@ -292,6 +338,75 @@ func runServe(cmd *cobra.Command, opts serveOptions) error {
 	return nil
 }
 
+// checkOptions 是 check 的参数。
+type checkOptions struct {
+	// links 表示是否检查渲染结果里的站内链接。
+	links bool
+}
+
+// runCheck 跑与 gen 完全相同的校验但不写任何产物，并把所有问题一次列全。
+//
+// 校验内容：模板语法与 data.json、每页渲染（含压缩）、忽略规则、产物路径冲突、
+// 产物目录护栏，以及（默认开启的）渲染结果里的站内链接。
+func runCheck(cmd *cobra.Command, globals *globalOptions, opts checkOptions) error {
+	logger := newLogger(cmd.ErrOrStderr())
+
+	// 与 gen 一样按产出方向取默认值：--mode auto 时为 prod，因此 prod 分支也会被校验。
+	resolved, err := resolveSettings(cmd, globals, localFlags{}, false)
+	if err != nil {
+		return err
+	}
+	out, err := resolved.resolveOutput()
+	if err != nil {
+		return err
+	}
+	// Publishing 为真：忽略规则按 gen 的语义生效（被忽略的文件视为不会发布）。
+	site, err := LoadSite(resolved.siteOptions([]string{out}, true))
+	if err != nil {
+		return err
+	}
+
+	var checker *linkChecker
+	var onPage func(string, []byte) error
+	if opts.links {
+		checker = newLinkChecker(site)
+		onPage = checker.checkPage
+	}
+
+	result, err := Generate(site, GenOptions{
+		Out:    out,
+		Minify: resolved.minify,
+		Check:  true,
+		OnPage: onPage,
+		Logger: logger,
+	})
+
+	problems := make([]string, 0, 8)
+	if err != nil {
+		problems = append(problems, strings.Split(err.Error(), "\n")...)
+	}
+	if checker != nil {
+		problems = append(problems, checker.issues()...)
+	}
+	if len(problems) > 0 {
+		// 一次列全：修一轮就能改完，而不是修一个跑一次。
+		return fmt.Errorf("检查未通过，共 %d 个问题：\n  - %s",
+			len(problems), strings.Join(problems, "\n  - "))
+	}
+
+	checkedLinks := 0
+	if checker != nil {
+		checkedLinks = checker.checked
+	}
+	logger.Info("检查通过",
+		"pages", result.Pages,
+		"assets", result.Assets,
+		"links", checkedLinks,
+		"out", result.Out,
+	)
+	return nil
+}
+
 // runGen 渲染全部页面并产出纯静态站。
 func runGen(cmd *cobra.Command, opts genOptions) error {
 	logger := newLogger(cmd.ErrOrStderr())
@@ -333,13 +448,29 @@ func newLogger(w io.Writer) *slog.Logger {
 	if w == nil {
 		w = os.Stderr
 	}
-	return slog.New(slog.NewTextHandler(w, nil))
+	// 终端里给非 2xx 的 status 上色；重定向到文件或管道时自动不上色，NO_COLOR 可关闭。
+	if wantColorLogs(w) {
+		w = newColorWriter(w)
+	}
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{
+		// 时间戳用 time.DateTime（2006-01-02 15:04:05）：日志按秒可读，
+		// 不带时区与毫秒，终端里对齐更整齐。注意 slog 会自动给含空格的值加引号。
+		ReplaceAttr: func(groups []string, attr slog.Attr) slog.Attr {
+			if len(groups) == 0 && attr.Key == slog.TimeKey {
+				return slog.String(slog.TimeKey, attr.Value.Time().Format(time.DateTime))
+			}
+			return attr
+		},
+	}))
 }
 
-const rootLongDescription = `goweb 用两个子命令覆盖「本地写页面 → 产出静态站」的完整流程：
+const rootLongDescription = `goweb 用四个子命令覆盖「初始化配置 → 校验 → 本地写页面 → 产出静态站」的完整流程：
 
+  init    生成默认配置文件 .goweb.yml（键名与参数同名，全部写出默认值并带注释）
+  check   只校验不产出：模板/渲染/忽略规则/产物路径冲突，外加站内链接检查
   serve   起开发服务器，页面 URL 与静态托管严格一致，改完自动重载并让浏览器自动刷新
-  gen     渲染模板产出纯静态站，可直接部署
+          （别名 dev）
+  gen     渲染模板产出纯静态站，可直接部署（别名 build）
 
 不带子命令时等价于 serve，直接在当前目录起开发服务器。
 
@@ -408,12 +539,21 @@ const rootExample = `  goweb                        # 等价于 goweb serve，�
   goweb --livereload=false     # 关掉浏览器自动刷新
   goweb --dir site gen         # 公共参数写在哪一层都生效
   goweb gen --out public       # 产出到 public/
-  goweb build                  # 与 goweb gen 完全等价（别名）`
+  goweb build                  # 与 goweb gen 完全等价（别名）
+  goweb dev                    # 与 goweb serve 完全等价（别名）`
 
 const serveExample = `  goweb serve
+  goweb dev                    # 别名，与 serve 等价
   goweb serve --addr :3000
   goweb serve --livereload=false
-  goweb serve --dir site --template templates`
+  goweb serve --dir pages --template templates`
+
+const checkExample = `  goweb check                  # 跑完整校验，问题一次列全
+  goweb check --links=false    # 不查站内链接`
+
+const initExample = `  goweb init                   # 生成 .goweb.yml
+  goweb init --force           # 覆盖已存在的配置
+  goweb init --config site/.goweb.yml`
 
 const genExample = `  goweb gen
   goweb build                  # 别名，与 gen 等价

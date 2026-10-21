@@ -275,12 +275,16 @@ func (s *Site) assetFile(urlPath string) (string, error) {
 	if rel == "" {
 		return "", errors.New("asset 需要资源路径，例如 {{asset \"/static/css/site.css\"}}")
 	}
-	full, ok := s.resolveURL(rel, false)
+	full, ok := s.resolveURL(rel)
 	if !ok {
 		return "", fmt.Errorf("asset 只接受会进入产物的静态资源：%s", urlPath)
 	}
 	ext := filepath.Ext(rel)
-	if strings.EqualFold(ext, pageExt) && s.hasPage(strings.TrimSuffix(rel, ext)) {
+	// 页面根里的 html 是渲染产物，不参与内容哈希。这里按「路径是否落在页面根内」判断，
+	// 而不是拿 URL 去比对页面名：页面根不是项目根时（例如 dir: pages），URL 里会多出
+	// 页面根那一层（/pages/x.html），按名字比对会漏判，于是给一个根本不会发布的文件
+	// 加上 ?v=<哈希>，把坏链接伪装成正常资源链接。
+	if strings.EqualFold(ext, pageExt) && withinDir(s.pagesRoot, full) {
 		return "", fmt.Errorf("asset 不接受页面（页面是渲染产物，请直接写路径）：%s", urlPath)
 	}
 	if s.ignoredForOutput(full, false) {
@@ -293,14 +297,10 @@ func (s *Site) assetFile(urlPath string) (string, error) {
 	return full, nil
 }
 
-// resolveURL 把 URL 相对路径解析成磁盘文件，页面根优先、资源根兜底。
-// requirePages 为真时只查页面根（用于判断「这个 URL 属于页面根空间」）。
-func (s *Site) resolveURL(rel string, requirePages bool) (string, bool) {
-	candidates := []string{s.pagesRoot}
-	if !requirePages {
-		candidates = append(candidates, s.assetsRoot)
-	}
-	for _, root := range candidates {
+// resolveURL 把 URL 相对路径解析成磁盘文件：页面根优先，资源根兜底。
+// 模板根、排除目录、隐藏项与 node_modules 一律视为不存在（与产物内容保持一致）。
+func (s *Site) resolveURL(rel string) (string, bool) {
+	for _, root := range []string{s.pagesRoot, s.assetsRoot} {
 		if root == "" {
 			continue
 		}
@@ -309,7 +309,7 @@ func (s *Site) resolveURL(rel string, requirePages bool) (string, bool) {
 			back == ".." || strings.HasPrefix(back, ".."+string(filepath.Separator)) {
 			continue
 		}
-		if s.Ignored(full) || s.WithinTemplateDir(full) {
+		if s.ignoredPath(full) || s.withinTemplateRoot(full) {
 			continue
 		}
 		if info, err := os.Stat(full); err == nil && info.Mode().IsRegular() {
@@ -366,8 +366,8 @@ func (s *Site) Render(name string) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// WithinTemplateDir 判断绝对路径是否落在模板根内。
-func (s *Site) WithinTemplateDir(absPath string) bool {
+// withinTemplateRoot 判断绝对路径是否落在模板根内（模板不产出页面、也不可访问）。
+func (s *Site) withinTemplateRoot(absPath string) bool {
 	return withinDir(s.templateRoot, absPath)
 }
 
@@ -382,8 +382,18 @@ func withinDir(dir, absPath string) bool {
 	return strings.HasPrefix(absPath, dir+string(filepath.Separator))
 }
 
-// Ignored 判断路径是否属于扫描与监听都忽略的范围，用于过滤文件系统事件。
-func (s *Site) Ignored(filePath string) bool {
+// ignoredName 判断单个路径组件是否属于「永远不参与扫描、也不对外提供」的名字：
+// 点号开头的隐藏项（.git、.DS_Store 等）与 node_modules。
+//
+// 这里刻意不区分文件与目录：名为 node_modules 的普通文件同样忽略。serve 与 gen 必须
+// 对同一个路径给出同一答案，否则会出现「gen 把它拷进产物、serve 却拒绝提供」的分叉。
+func ignoredName(name string) bool {
+	return strings.HasPrefix(name, ".") || name == nodeModulesDir
+}
+
+// ignoredPath 判断绝对路径是否属于扫描与监听都忽略的范围：任一路径组件命中 ignoredName，
+// 或落在显式排除目录（产物目录等）内。用于过滤文件系统事件与判断资源能否对外提供。
+func (s *Site) ignoredPath(filePath string) bool {
 	if !s.withinAnyRoot(filePath) {
 		return true
 	}
@@ -391,8 +401,8 @@ func (s *Site) Ignored(filePath string) bool {
 	if err != nil {
 		return true
 	}
-	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
-		if strings.HasPrefix(part, ".") || part == nodeModulesDir {
+	for part := range strings.SplitSeq(filepath.ToSlash(rel), "/") {
+		if ignoredName(part) {
 			return true
 		}
 	}
@@ -426,7 +436,7 @@ func (s *Site) WatchPaths() ([]string, error) {
 				// 根可能不存在（例如站点还没建 templates/），忽略即可。
 				return nil //nolint:nilerr
 			}
-			if filePath != root && s.skipPath(filePath, entry.IsDir()) {
+			if filePath != root && s.skipInWalk(filePath) {
 				if entry.IsDir() {
 					return fs.SkipDir
 				}
@@ -452,108 +462,32 @@ func (s *Site) WatchPaths() ([]string, error) {
 // 模板名沿用「相对项目根的路径去扩展名」，页面名是「相对页面根的路径去扩展名」，
 // 因此默认布局下模板名仍是 templates/header 这类旧写法。
 func (s *Site) compile() (siteSnapshot, error) {
-	var snapshot siteSnapshot
-	snapshot.tmpl = template.New(s.pagesRoot)
-	snapshot.pages = make(map[string]string)
+	snapshot := siteSnapshot{
+		tmpl:  template.New(s.pagesRoot),
+		pages: make(map[string]string, 16),
+	}
 
 	// 模板函数绑定在本次加载的上下文上：模式、构建时间与资源哈希都随快照一起生效。
 	ctx := &renderContext{site: s, mode: s.mode}
 	funcs := templateFuncs(ctx)
 
-	// 站点内容里最新的文件修改时间，作为「构建时间」的默认值。
-	newest := s.newestModTime()
-
-	// 模板根与页面根重合（或未配置模板根）时，页面根里的 html 全是页面。
-	separateTemplateRoot := s.templateRoot != "" && s.templateRoot != s.pagesRoot
-	templateFiles := make([]string, 0, 16)
-
-	err := filepath.WalkDir(s.pagesRoot, func(filePath string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if filePath != s.pagesRoot && s.skipPath(filePath, entry.IsDir()) {
-			if entry.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		// 模板根落在页面根里时，那里的 html 是局部模板：交给下面单独解析。
-		if separateTemplateRoot && filePath != s.pagesRoot && s.WithinTemplateDir(filePath) {
-			if entry.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		ext := filepath.Ext(filePath)
-		if !strings.EqualFold(ext, pageExt) {
-			return nil
-		}
-		rel, err := filepath.Rel(s.pagesRoot, filePath)
-		if err != nil {
-			return fmt.Errorf("计算相对路径 %s: %w", filePath, err)
-		}
-		name := strings.TrimSuffix(filepath.ToSlash(rel), ext)
-		body, err := os.ReadFile(filePath)
-		if err != nil {
-			return fmt.Errorf("读取模板 %s: %w", rel, err)
-		}
-		if _, err := snapshot.tmpl.New(name).Funcs(funcs).Parse(string(body)); err != nil {
-			return fmt.Errorf("解析模板 %s: %w", rel, err)
-		}
-		snapshot.pages[name] = filePath
-		return nil
-	})
+	pageFiles, err := s.pageFiles()
 	if err != nil {
 		return snapshot, err
 	}
-
-	// 单独解析模板根：模板根可能完全在页面根之外，页面扫描看不到它。
-	// 模板根不存在属于正常情况（站点可以没有局部模板）。
-	if separateTemplateRoot {
-		if _, statErr := os.Stat(s.templateRoot); errors.Is(statErr, fs.ErrNotExist) {
-			separateTemplateRoot = false
-		}
-	}
-	if separateTemplateRoot {
-		err := filepath.WalkDir(s.templateRoot, func(filePath string, entry fs.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
-			if filePath != s.templateRoot && s.skipPath(filePath, entry.IsDir()) {
-				if entry.IsDir() {
-					return fs.SkipDir
-				}
-				return nil
-			}
-			if entry.IsDir() {
-				return nil
-			}
-			ext := filepath.Ext(filePath)
-			if !strings.EqualFold(ext, pageExt) {
-				return nil
-			}
-			templateFiles = append(templateFiles, filePath)
-			return nil
-		})
-		if err != nil {
+	for _, filePath := range pageFiles {
+		if err := s.parsePage(&snapshot, funcs, filePath); err != nil {
 			return snapshot, err
 		}
 	}
 
-	for _, filePath := range templateFiles {
-		name, err := s.templateName(filePath)
-		if err != nil {
+	partialFiles, err := s.partialFiles()
+	if err != nil {
+		return snapshot, err
+	}
+	for _, filePath := range partialFiles {
+		if err := s.parsePartial(&snapshot, funcs, filePath); err != nil {
 			return snapshot, err
-		}
-		body, err := os.ReadFile(filePath)
-		if err != nil {
-			return snapshot, fmt.Errorf("读取模板 %s: %w", filePath, err)
-		}
-		if _, err := snapshot.tmpl.New(name).Funcs(funcs).Parse(string(body)); err != nil {
-			return snapshot, fmt.Errorf("解析模板 %s: %w", filePath, err)
 		}
 	}
 
@@ -562,27 +496,152 @@ func (s *Site) compile() (siteSnapshot, error) {
 		return snapshot, err
 	}
 	snapshot.data = data
-
-	// 数据文件的修改时间也要算进去，否则只改 data.json 时构建时间不会变。
-	if s.buildTimeOverride.IsZero() {
-		if dataPath := s.DataFile(); dataPath != "" {
-			if info, err := os.Stat(dataPath); err == nil && info.ModTime().After(newest) {
-				newest = info.ModTime()
-			}
-		}
-		if newest.IsZero() {
-			// 空站点没有可推导的时间，退回到当前时间（这种站点本来也没有内容可复现）。
-			newest = time.Now()
-		}
-		ctx.buildTime = newest.Truncate(time.Second)
-	} else {
-		ctx.buildTime = s.buildTimeOverride
-	}
-	snapshot.buildTime = ctx.buildTime
+	// 构建时间要同时写进快照与渲染上下文：快照供 Site.BuildTime() 查询，
+	// 上下文供模板里的 buildTime/year/date 使用（少了它模板会拿到零值时间）。
+	snapshot.buildTime = s.resolveBuildTime()
+	ctx.buildTime = snapshot.buildTime
 	if s.fingerprint {
 		snapshot.rewrite = ctx.fingerprintHTML
 	}
 	return snapshot, nil
+}
+
+// pageFiles 返回页面根里的全部页面文件；模板根落在页面根内时，其子树交给 partialFiles。
+func (s *Site) pageFiles() ([]string, error) {
+	separateTemplateRoot := s.hasSeparateTemplateRoot()
+	var files []string
+
+	err := filepath.WalkDir(s.pagesRoot, func(filePath string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if filePath == s.pagesRoot {
+			return nil
+		}
+		if s.skipInWalk(filePath) {
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if separateTemplateRoot && s.withinTemplateRoot(filePath) {
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !entry.IsDir() && isPageFile(filePath) {
+			files = append(files, filePath)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return files, nil
+}
+
+// partialFiles 返回模板根里的全部局部模板；没有独立模板根（或它不存在）时返回空。
+func (s *Site) partialFiles() ([]string, error) {
+	if !s.hasSeparateTemplateRoot() {
+		return nil, nil
+	}
+
+	var files []string
+	err := filepath.WalkDir(s.templateRoot, func(filePath string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if filePath == s.templateRoot {
+			return nil
+		}
+		if s.skipInWalk(filePath) {
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !entry.IsDir() && isPageFile(filePath) {
+			files = append(files, filePath)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return files, nil
+}
+
+// hasSeparateTemplateRoot 判断是否存在「独立于页面根且真实存在」的模板根。
+// 模板根与页面根重合（或未配置）时，页面根里的 html 全是页面；模板根不存在则说明
+// 站点没有局部模板——两种情况都不需要单独扫描模板根。
+func (s *Site) hasSeparateTemplateRoot() bool {
+	if s.templateRoot == "" || s.templateRoot == s.pagesRoot {
+		return false
+	}
+	_, err := os.Stat(s.templateRoot)
+	return err == nil
+}
+
+// isPageFile 判断文件是否为页面/局部模板（*.html，扩展名大小写不敏感）。
+func isPageFile(filePath string) bool {
+	return strings.EqualFold(filepath.Ext(filePath), pageExt)
+}
+
+// parsePage 读取并解析一个页面模板，并登记进页面清单（页面名相对页面根）。
+func (s *Site) parsePage(snapshot *siteSnapshot, funcs template.FuncMap, filePath string) error {
+	rel, err := filepath.Rel(s.pagesRoot, filePath)
+	if err != nil {
+		return fmt.Errorf("计算相对路径 %s: %w", filePath, err)
+	}
+	name := strings.TrimSuffix(filepath.ToSlash(rel), filepath.Ext(filePath))
+	if err := parseTemplate(snapshot, funcs, name, filePath); err != nil {
+		return err
+	}
+	snapshot.pages[name] = filePath
+	return nil
+}
+
+// parsePartial 读取并解析一个局部模板；局部模板不登记为页面。
+func (s *Site) parsePartial(snapshot *siteSnapshot, funcs template.FuncMap, filePath string) error {
+	name, err := s.templateName(filePath)
+	if err != nil {
+		return err
+	}
+	return parseTemplate(snapshot, funcs, name, filePath)
+}
+
+// parseTemplate 读取文件并解析进共享的模板命名空间。
+func parseTemplate(snapshot *siteSnapshot, funcs template.FuncMap, name, filePath string) error {
+	body, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("读取模板 %s: %w", filePath, err)
+	}
+	if _, err := snapshot.tmpl.New(name).Funcs(funcs).Parse(string(body)); err != nil {
+		return fmt.Errorf("解析模板 %s: %w", filePath, err)
+	}
+	return nil
+}
+
+// resolveBuildTime 给出本次快照使用的构建时间：显式覆盖优先，否则取站点内容里最新的
+// 文件修改时间（数据文件也算在内），保证「同样的输入产出同样的结果」。
+func (s *Site) resolveBuildTime() time.Time {
+	if !s.buildTimeOverride.IsZero() {
+		return s.buildTimeOverride
+	}
+
+	newest := s.newestModTime()
+	// 数据文件的修改时间也要算进去，否则只改 data.json 时构建时间不会变。
+	if dataPath := s.DataFile(); dataPath != "" {
+		if info, err := os.Stat(dataPath); err == nil && info.ModTime().After(newest) {
+			newest = info.ModTime()
+		}
+	}
+	if newest.IsZero() {
+		// 空站点没有可推导的时间，退回到当前时间（这种站点本来也没有内容可复现）。
+		newest = time.Now()
+	}
+	return newest.Truncate(time.Second)
 }
 
 // newestModTime 返回三个根下（忽略项之外）最新的文件修改时间。
@@ -596,7 +655,7 @@ func (s *Site) newestModTime() time.Time {
 			if walkErr != nil {
 				return nil //nolint:nilerr // 根不存在属于正常情况
 			}
-			if filePath != root && s.skipPath(filePath, entry.IsDir()) {
+			if filePath != root && s.skipInWalk(filePath) {
 				if entry.IsDir() {
 					return fs.SkipDir
 				}
@@ -635,13 +694,11 @@ func (s *Site) loadData() (map[string]any, error) {
 	return data, nil
 }
 
-// skipPath 判断扫描阶段是否跳过某个路径：点号开头的隐藏项、node_modules 与显式排除目录。
-func (s *Site) skipPath(filePath string, isDir bool) bool {
-	base := filepath.Base(filePath)
-	if strings.HasPrefix(base, ".") {
-		return true
-	}
-	if isDir && base == nodeModulesDir {
+// skipInWalk 判断 walk 阶段是否跳过某个路径。
+// 只按 basename 判断：父目录一旦跳过就不会再往下走，因此不必逐组件检查；
+// 逐组件版本是 ignoredPath，用于扫描之外的单点判断。
+func (s *Site) skipInWalk(filePath string) bool {
+	if ignoredName(filepath.Base(filePath)) {
 		return true
 	}
 	return s.isExcluded(filePath)
@@ -774,7 +831,7 @@ func (s *Site) servableFile(rel string) (string, bool) {
 	if rel == "" {
 		return "", false
 	}
-	return s.resolveURL(rel, false)
+	return s.resolveURL(rel)
 }
 
 // normalizePath 按 nginx 的方式归一化 URL 路径：折叠重复斜杠、解析 . 与 .. 段，
@@ -790,8 +847,8 @@ func normalizePath(urlPath string) string {
 		strings.HasSuffix(urlPath, "/.") ||
 		strings.HasSuffix(urlPath, "/..")
 
-	segments := make([]string, 0, 8)
-	for _, segment := range strings.Split(urlPath, "/") {
+	var segments []string
+	for segment := range strings.SplitSeq(urlPath, "/") {
 		switch segment {
 		case "", ".":
 			continue

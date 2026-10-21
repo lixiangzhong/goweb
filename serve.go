@@ -31,8 +31,10 @@ func newHandler(site *Site, logger *slog.Logger, live *liveReloadHub) http.Handl
 	return &handler{site: site, logger: logger, live: live}
 }
 
+// ServeHTTP 处理一次请求：包一层 statusRecorder 记录状态码，再打一条访问日志。
+// 日志只留 method/path/status：开发时关心的是「哪个请求返回了什么状态」，
+// 耗时留给浏览器 devtools 或压测工具，不占终端宽度。
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
 	recorder := &statusRecorder{ResponseWriter: w}
 	h.serve(recorder, r)
 
@@ -44,7 +46,6 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"method", r.Method,
 		"path", r.URL.Path,
 		"status", status,
-		"duration", time.Since(start),
 	)
 }
 
@@ -116,6 +117,7 @@ type statusRecorder struct {
 	status int
 }
 
+// WriteHeader 透传状态码，并只记录第一个——后续重复调用不会覆盖访问日志里的状态码。
 func (r *statusRecorder) WriteHeader(code int) {
 	if r.status == 0 {
 		r.status = code
@@ -123,6 +125,7 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+// Write 透传响应体；没显式调用过 WriteHeader 时按 200 记录。
 func (r *statusRecorder) Write(body []byte) (int, error) {
 	if r.status == 0 {
 		r.status = http.StatusOK
@@ -214,7 +217,7 @@ func (w *siteWatcher) loop() {
 			if !ok {
 				return
 			}
-			if w.site.Ignored(event.Name) || isSelfOutput(w.selfOutputs, event.Name) {
+			if w.site.ignoredPath(event.Name) || isSelfOutput(w.selfOutputs, event.Name) {
 				continue
 			}
 			w.schedule()

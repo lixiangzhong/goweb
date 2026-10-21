@@ -114,7 +114,7 @@ func (c *renderContext) fingerprintURL(pageDir, raw string) (string, bool, error
 	}
 
 	// 文件存在但被忽略规则排除：产物里不会有它，直接报错。
-	if full, ok := c.site.resolveURL(relative, false); ok && c.site.ignoredForOutput(full, false) {
+	if full, ok := c.site.resolveURL(relative); ok && c.site.ignoredForOutput(full, false) {
 		return "", false, fmt.Errorf("资源被忽略规则排除，产物里不会有它：%s", value)
 	}
 

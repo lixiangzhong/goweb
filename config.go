@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -84,6 +84,26 @@ func loadFileConfig(explicit, start string) (fileConfig, string, error) {
 	return fileConfig{}, startAbs, nil
 }
 
+// findConfigFile 从 start 逐级向上查找 .goweb.yml，返回找到的路径（找不到返回空字符串）。
+// 与 loadFileConfig 共用同一套发现规则：init 靠它判断「项目根是不是已经有配置」。
+func findConfigFile(start string) (string, error) {
+	startAbs, err := filepath.Abs(start)
+	if err != nil {
+		return "", fmt.Errorf("解析运行目录 %q: %w", start, err)
+	}
+	for dir := startAbs; ; {
+		candidate := filepath.Join(dir, configFileName)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", nil
+		}
+		dir = parent
+	}
+}
+
 // parseFileConfig 解析配置文件；未知字段直接报错，避免拼错字段名后静默无效。
 func parseFileConfig(path string) (fileConfig, error) {
 	body, err := os.ReadFile(path)
@@ -123,14 +143,14 @@ func friendlyConfigError(err error) string {
 
 // configKeys 返回配置文件支持的键（从结构体标签读取，避免两处维护）。
 func configKeys() []string {
-	structType := reflect.TypeOf(fileConfig{})
+	structType := reflect.TypeFor[fileConfig]()
 	keys := make([]string, 0, structType.NumField())
-	for i := 0; i < structType.NumField(); i++ {
-		if key := structType.Field(i).Tag.Get("yaml"); key != "" {
+	for field := range structType.Fields() {
+		if key := field.Tag.Get("yaml"); key != "" {
 			keys = append(keys, key)
 		}
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	return keys
 }
 

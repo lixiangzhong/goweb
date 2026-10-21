@@ -148,6 +148,13 @@ func (c *renderContext) formatDate(layout string, value any) (string, error) {
 	return t.Format(layout), nil
 }
 
+// acceptedTimeLayouts 是模板时间参数与 --build-time 共同接受的格式，单一真相源。
+// time.DateTime 即 "2006-01-02 15:04:05"，time.DateOnly 即 "2006-01-02"。
+var acceptedTimeLayouts = []string{time.RFC3339, time.DateTime, time.DateOnly}
+
+// timeLayoutsHint 是给用户看的格式提示，与 acceptedTimeLayouts 一一对应。
+const timeLayoutsHint = "RFC3339 / 2006-01-02 15:04:05 / 2006-01-02"
+
 // parseTimeValue 接受 time.Time、Unix 秒（int/int64/float64）与常见时间字符串。
 func parseTimeValue(value any) (time.Time, error) {
 	switch v := value.(type) {
@@ -160,12 +167,12 @@ func parseTimeValue(value any) (time.Time, error) {
 	case float64:
 		return time.Unix(int64(v), 0), nil
 	case string:
-		for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02"} {
+		for _, layout := range acceptedTimeLayouts {
 			if parsed, err := time.Parse(layout, v); err == nil {
 				return parsed, nil
 			}
 		}
-		return time.Time{}, fmt.Errorf("无法解析时间 %q（支持 RFC3339 / 2006-01-02 15:04:05 / 2006-01-02）", v)
+		return time.Time{}, fmt.Errorf("无法解析时间 %q（支持 %s）", v, timeLayoutsHint)
 	default:
 		return time.Time{}, fmt.Errorf("不支持的时间类型 %T", value)
 	}

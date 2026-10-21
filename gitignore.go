@@ -145,8 +145,8 @@ func (p ignorePattern) matches(rel string) bool {
 		return true
 	}
 	// `**/foo` 这类模式在 git 里也能命中根下的 foo（`**` 可匹配零层）。
-	if strings.HasPrefix(p.pattern, "**/") {
-		if matched, err := doublestar.Match(strings.TrimPrefix(p.pattern, "**/"), rel); err == nil && matched {
+	if rest, ok := strings.CutPrefix(p.pattern, "**/"); ok {
+		if matched, err := doublestar.Match(rest, rel); err == nil && matched {
 			return true
 		}
 	}
