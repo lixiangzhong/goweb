@@ -353,8 +353,10 @@ func TestGenWithoutTemplateDir(t *testing.T) {
 	if _, stderr, err := executeCLIInSite(t, siteDir, "gen", "--template", "", "--out", out); err != nil {
 		t.Fatalf("gen 出错: %v（stderr: %s）", err, stderr)
 	}
-	if got := readFile(t, filepath.Join(out, "index.html")); got != "<html></html>" {
-		t.Fatalf("没有模板目录时不应加载数据，产物 = %q", got)
+	// 断言「数据没被加载」而不是逐字比对产物：产物默认会被压缩，
+	// 例如空文档会被压成空文件，逐字断言会把压缩行为卷进来。
+	if got := readFile(t, filepath.Join(out, "index.html")); strings.Contains(got, "IGNORED") {
+		t.Fatalf("没有模板目录时不应加载 data.json，产物 = %q", got)
 	}
 	// templates/ 不再是模板目录，其中的文件按静态资源拷贝。
 	if _, err := os.Stat(filepath.Join(out, "templates", "data.json")); err != nil {

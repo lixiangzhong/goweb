@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -36,8 +37,8 @@ const (
 	e2eHTTPTimeout = 5 * time.Second
 )
 
-// e2eAddrRe 匹配服务端启动日志里的真实监听地址。
-var e2eAddrRe = regexp.MustCompile(`addr=([0-9.]+:[0-9]+)`)
+// e2eAddrRe 匹配服务端启动日志里的真实监听地址（含 IPv6 通配写法如 [::]:8081）。
+var e2eAddrRe = regexp.MustCompile(`addr=(\S+)`)
 
 // buildGoweb 编译出真实二进制，供 e2e 像用户一样调用。
 func buildGoweb(t *testing.T) string {
@@ -186,6 +187,129 @@ func TestE2E(t *testing.T) {
 		// 别名要出现在帮助里，用户才知道它存在。
 		if code, stdout, _ := runBinary(t, binary, "gen", "--help"); code != 0 || !strings.Contains(stdout, "build") {
 			t.Fatalf("gen --help 应提示别名 build: code=%d stdout=%q", code, stdout)
+		}
+	})
+
+	t.Run("build 默认压缩页面与资源，serve 保持可读", func(t *testing.T) {
+		// 用三根布局：页面在 pages/，static/partial.html 因此是「页面根外的 html 资源」，
+		// 不参与模板渲染，可以用它验证 HTML 注释是压缩删掉的。
+		// 注意：模板里的 HTML 注释本来就会被 html/template 去掉，所以页面的压缩特征用换行判断。
+		siteDir := writeSite(t, map[string]string{
+			"pages/index.html":    "<html>\n  <body>\n    <pre>  保留  </pre>\n    <p>{{.site.title}}</p>\n  </body>\n</html>\n",
+			"templates/data.json": `{"site":{"title":"E2E-MINIFY"}}`,
+			"static/site.css":     "/* 注释 */\n.a {\n  color : red ;\n}\n",
+			"static/site.js":      "// 注释\nfunction add(first, second) {\n  return first + second;\n}\n",
+			"static/partial.html": "<!-- 片段注释 --><section>\n  <p>片段</p>\n</section>\n",
+			"static/raw.txt":      "  原样文本  \n",
+		})
+		out := filepath.Join(t.TempDir(), "dist")
+		code, _, stderr := runBinaryIn(t, siteDir, binary, "build", "--dir", "pages", "--out", out)
+		if code != 0 {
+			t.Fatalf("build 退出码 = %d，期望 0（stderr: %s）", code, stderr)
+		}
+		page := readFile(t, filepath.Join(out, "index.html"))
+		if strings.Contains(page, "\n") {
+			t.Fatalf("产物页面应被压缩（不应有换行）: %q", page)
+		}
+		if !strings.Contains(page, "<pre>  保留  </pre>") || !strings.Contains(page, "E2E-MINIFY") {
+			t.Fatalf("压缩不应改动预格式化内容或丢内容: %s", page)
+		}
+		css := readFile(t, filepath.Join(out, "static", "site.css"))
+		if strings.Contains(css, "注释") || !strings.Contains(css, ".a{color:red}") {
+			t.Fatalf("CSS 应被压缩: %s", css)
+		}
+		// JS 只去空白与注释，变量名保持原样。
+		if js := readFile(t, filepath.Join(out, "static", "site.js")); !strings.Contains(js, "function add(first,second)") {
+			t.Fatalf("JS 变量名不应被改动: %s", js)
+		}
+		if partial := readFile(t, filepath.Join(out, "static", "partial.html")); strings.Contains(partial, "片段注释") {
+			t.Fatalf("HTML 资源里的注释应被压缩删除: %s", partial)
+		}
+		if raw := readFile(t, filepath.Join(out, "static", "raw.txt")); raw != "  原样文本  \n" {
+			t.Fatalf("不可压缩的文件应逐字节保留: %q", raw)
+		}
+
+		// serve 不压缩：开发时看到的是可读的原始渲染结果。
+		server := startServe(t, binary, siteDir, "--dir", "pages")
+		client := &http.Client{Timeout: e2eHTTPTimeout}
+		status, served := e2eGet(t, client, server.url+"/")
+		if status != 200 || !strings.Contains(served, "\n") || !strings.Contains(served, "E2E-MINIFY") {
+			t.Fatalf("serve 应保持可读（不压缩）: status=%d body=%q", status, served)
+		}
+
+		// --minify=false 的产物与 serve 渲染结果一样保留换行。
+		plain := filepath.Join(t.TempDir(), "plain")
+		if code, _, stderr := runBinaryIn(t, siteDir, binary, "build", "--dir", "pages", "--out", plain, "--minify=false"); code != 0 {
+			t.Fatalf("build --minify=false 退出码 = %d（stderr: %s）", code, stderr)
+		}
+		if plainPage := readFile(t, filepath.Join(plain, "index.html")); !strings.Contains(plainPage, "\n") {
+			t.Fatalf("--minify=false 时不应压缩（应保留换行）: %q", plainPage)
+		}
+	})
+
+	t.Run("默认端口被占用时自动递增端口", func(t *testing.T) {
+		// 占住通配 :8080（实测：只占 127.0.0.1:8080 时，通配绑定在 macOS 上仍会成功）；
+		// 占不上（本机 8080 已被别人用）就跳过，递增逻辑本身由 listen_test.go 覆盖。
+		blocker, err := net.Listen("tcp", ":8080")
+		if err != nil {
+			t.Skipf("本机 8080 不可用（%v），跳过", err)
+		}
+		defer blocker.Close()
+
+		server := startServeDefaultAddr(t, binary, writeE2ESite(t))
+		logs := server.logs()
+		if !strings.Contains(logs, "端口被占用") {
+			t.Fatalf("应记录端口被占用并改用其它端口: %s", logs)
+		}
+
+		addr := strings.TrimPrefix(server.url, "http://")
+		if portOf(t, addr) == 8080 {
+			t.Skip("本平台允许同时绑定通配与 127.0.0.1 的同一端口，跳过断言")
+		}
+		// 用测试过的地址推导逻辑把通配地址变成可访问的 URL，再确认服务真的起来了。
+		url := strings.TrimSuffix(browserURL(fakeAddr(addr)), "/")
+		client := &http.Client{Timeout: e2eHTTPTimeout}
+		if status, body := e2eGet(t, client, url+"/about.html"); status != 200 || !strings.Contains(body, "E2E-SITE") {
+			t.Fatalf("递增端口后的服务应可访问: status=%d body=%s url=%s", status, body, url)
+		}
+	})
+
+	t.Run("日志写在站点目录内不会自我触发重载", func(t *testing.T) {
+		siteDir := writeE2ESite(t)
+		// 复现用户最容易踩的写法：`goweb serve > site/build.log`。
+		// 日志文件在站点里，它自己的每次写入都会产生文件事件——修好之前会形成重载死循环
+		// （实测 3 秒 19 次重载），现在应当一次都不触发。
+		logPath := filepath.Join(siteDir, "build.log")
+		logFile, err := os.Create(logPath)
+		if err != nil {
+			t.Fatalf("创建日志文件: %v", err)
+		}
+		defer logFile.Close()
+
+		cmd := exec.Command(binary, "serve", "--open=false", "--addr", "127.0.0.1:0")
+		cmd.Dir = siteDir
+		cmd.Stdout, cmd.Stderr = logFile, logFile
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("启动 serve: %v", err)
+		}
+		t.Cleanup(func() {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		})
+
+		// 等服务启动（地址写在同一个日志文件里），再观察一段时间是否有重载。
+		waitFor(t, e2eStartupTimeout, func() bool {
+			body, err := os.ReadFile(logPath)
+			return err == nil && e2eAddrRe.Match(body)
+		}, "应把启动日志写进站点内的日志文件")
+
+		time.Sleep(2 * time.Second)
+		body, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Fatalf("读取日志: %v", err)
+		}
+		if count := strings.Count(string(body), "站点已重载"); count != 0 {
+			t.Fatalf("日志文件自身不应触发重载，实际触发 %d 次:\n%s", count, body)
 		}
 	})
 
@@ -536,10 +660,24 @@ func startServe(t *testing.T, binary, siteDir string, extraArgs ...string) *e2eS
 // startServeEnv 与 startServe 相同，但可以追加环境变量（例如替换打开浏览器的命令）。
 func startServeEnv(t *testing.T, binary, siteDir string, env []string, extraArgs ...string) *e2eServer {
 	t.Helper()
+	args := append([]string{"serve", "--addr", "127.0.0.1:0"}, extraArgs...)
+	return startServeProcess(t, binary, siteDir, env, args)
+}
+
+// startServeDefaultAddr 不带 --addr 启动，用的是内置默认端口 :8080，
+// 用于验证「没有显式指定端口时被占用会自动递增」。
+func startServeDefaultAddr(t *testing.T, binary, siteDir string) *e2eServer {
+	t.Helper()
+	return startServeProcess(t, binary, siteDir, nil,
+		[]string{"serve", "--open=false", "--livereload=false"})
+}
+
+// startServeProcess 启动 serve 进程并等待它打印真实监听地址。
+func startServeProcess(t *testing.T, binary, siteDir string, env, args []string) *e2eServer {
+	t.Helper()
 
 	// 在站点目录里启动，等价于用户在项目根运行 goweb：
 	// 项目根 = 站点目录，templates/ 与静态资源都在它下面。
-	args := append([]string{"serve", "--addr", "127.0.0.1:0"}, extraArgs...)
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = siteDir
 	if len(env) > 0 {

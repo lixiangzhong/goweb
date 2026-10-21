@@ -377,3 +377,39 @@ func TestWatchBroadcastsOnlyOnSuccessfulReload(t *testing.T) {
 		t.Fatalf("重载失败不应通知浏览器，实际收到 %d 次", len(reloaded))
 	}
 }
+
+// TestSelfOutputFilesAndMatch 覆盖「忽略本进程日志文件」的判定。
+// 测试里把 os.Stdout 临时指向一个真实文件，模拟 `goweb serve > site/build.log`。
+func TestSelfOutputFilesAndMatch(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "build.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatalf("创建日志文件: %v", err)
+	}
+	defer logFile.Close()
+
+	original := os.Stdout
+	os.Stdout = logFile
+	t.Cleanup(func() { os.Stdout = original })
+
+	files := selfOutputFiles()
+	if len(files) == 0 {
+		t.Fatal("stderr/stdout 重定向到文件时应当收集到输出文件")
+	}
+	if !isSelfOutput(files, logPath) {
+		t.Fatalf("日志文件自身应被识别: %s", logPath)
+	}
+	other := filepath.Join(t.TempDir(), "index.html")
+	if err := os.WriteFile(other, []byte("x"), 0o644); err != nil {
+		t.Fatalf("写入其它文件: %v", err)
+	}
+	if isSelfOutput(files, other) {
+		t.Fatal("站点里的普通文件不应被当成日志输出")
+	}
+	if isSelfOutput(files, filepath.Join(t.TempDir(), "missing")) {
+		t.Fatal("不存在的文件不应被当成日志输出")
+	}
+	if isSelfOutput(nil, logPath) {
+		t.Fatal("没有输出文件时不应命中")
+	}
+}
