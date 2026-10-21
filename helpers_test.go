@@ -36,6 +36,14 @@ func newHandlerWithLog(site *Site) (http.Handler, *syncBuffer) {
 	return newHandler(site, slog.New(slog.NewTextHandler(logs, nil)), nil), logs
 }
 
+// executeCLIInSite 先把进程工作目录切到站点目录，再执行 CLI。
+// 等价于用户在项目根运行 goweb：项目根 = 站点目录，三个根的默认值都在它下面。
+func executeCLIInSite(t *testing.T, siteDir string, args ...string) (string, string, error) {
+	t.Helper()
+	t.Chdir(siteDir)
+	return executeCLI(args...)
+}
+
 // writeFile 写入文件并创建父目录。
 func writeFile(t *testing.T, path, body string) {
 	t.Helper()

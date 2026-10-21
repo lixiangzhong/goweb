@@ -64,7 +64,7 @@ func TestE2E(t *testing.T) {
 
 	t.Run("gen 产出与源码同路径的扁平产物", func(t *testing.T) {
 		out := filepath.Join(t.TempDir(), "dist")
-		code, _, stderr := runBinary(t, binary, "gen", "--dir", siteDir, "--out", out)
+		code, _, stderr := runBinaryIn(t, siteDir, binary, "gen", "--out", out)
 		if code != 0 {
 			t.Fatalf("gen 退出码 = %d，期望 0（stderr: %s）", code, stderr)
 		}
@@ -117,12 +117,12 @@ func TestE2E(t *testing.T) {
 
 	t.Run("gen 重复执行结果一致", func(t *testing.T) {
 		out := filepath.Join(t.TempDir(), "dist")
-		if code, _, stderr := runBinary(t, binary, "gen", "--dir", siteDir, "--out", out); code != 0 {
+		if code, _, stderr := runBinaryIn(t, siteDir, binary, "gen", "--out", out); code != 0 {
 			t.Fatalf("首次 gen 失败: %s", stderr)
 		}
 		first := readFile(t, filepath.Join(out, "index.html"))
 
-		if code, _, stderr := runBinary(t, binary, "gen", "--dir", siteDir, "--out", out); code != 0 {
+		if code, _, stderr := runBinaryIn(t, siteDir, binary, "gen", "--out", out); code != 0 {
 			t.Fatalf("二次 gen 失败: %s", stderr)
 		}
 		if second := readFile(t, filepath.Join(out, "index.html")); first != second {
@@ -132,7 +132,7 @@ func TestE2E(t *testing.T) {
 
 	t.Run("gen --clean=false 保留遗留文件", func(t *testing.T) {
 		out := filepath.Join(t.TempDir(), "dist")
-		if code, _, stderr := runBinary(t, binary, "gen", "--dir", siteDir, "--out", out); code != 0 {
+		if code, _, stderr := runBinaryIn(t, siteDir, binary, "gen", "--out", out); code != 0 {
 			t.Fatalf("gen 失败: %s", stderr)
 		}
 		stale := filepath.Join(out, "stale.html")
@@ -140,14 +140,14 @@ func TestE2E(t *testing.T) {
 			t.Fatalf("写入遗留文件: %v", err)
 		}
 
-		if code, _, stderr := runBinary(t, binary, "gen", "--dir", siteDir, "--out", out, "--clean=false"); code != 0 {
+		if code, _, stderr := runBinaryIn(t, siteDir, binary, "gen", "--out", out, "--clean=false"); code != 0 {
 			t.Fatalf("--clean=false 生成失败: %s", stderr)
 		}
 		if _, err := os.Stat(stale); err != nil {
 			t.Fatalf("--clean=false 不应删除遗留文件: %v", err)
 		}
 
-		if code, _, stderr := runBinary(t, binary, "gen", "--dir", siteDir, "--out", out); code != 0 {
+		if code, _, stderr := runBinaryIn(t, siteDir, binary, "gen", "--out", out); code != 0 {
 			t.Fatalf("gen 失败: %s", stderr)
 		}
 		if _, err := os.Stat(stale); err == nil {
@@ -156,7 +156,8 @@ func TestE2E(t *testing.T) {
 	})
 
 	t.Run("gen 护栏拒绝危险产物目录", func(t *testing.T) {
-		code, _, stderr := runBinary(t, binary, "gen", "--dir", siteDir, "--out", siteDir)
+		// 在站点目录里跑，--out . 即把项目根当产物目录，护栏应当拦下。
+		code, _, stderr := runBinaryIn(t, siteDir, binary, "gen", "--out", ".")
 		if code == 0 {
 			t.Fatal("把页面目录当产物目录应当失败")
 		}
@@ -168,12 +169,32 @@ func TestE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("build 别名与 gen 等价", func(t *testing.T) {
+		siteDir := writeE2ESite(t)
+		out := filepath.Join(t.TempDir(), "built")
+		code, _, stderr := runBinaryIn(t, siteDir, binary, "build", "--out", out)
+		if code != 0 {
+			t.Fatalf("build 退出码 = %d，期望 0（stderr: %s）", code, stderr)
+		}
+		if !strings.Contains(stderr, "静态站已生成") || !strings.Contains(stderr, "mode=prod") {
+			t.Fatalf("build 应与 gen 一样产出并默认 prod 模式: %s", stderr)
+		}
+		want := []string{"about.html", "help/74.html", "help/index.html", "index.html", "robots.txt", "static/css/site.css", "static/js/site.js"}
+		if got := listFiles(t, out); !equalStrings(got, want) {
+			t.Fatalf("build 产物清单 = %v，期望 %v", got, want)
+		}
+		// 别名要出现在帮助里，用户才知道它存在。
+		if code, stdout, _ := runBinary(t, binary, "gen", "--help"); code != 0 || !strings.Contains(stdout, "build") {
+			t.Fatalf("gen --help 应提示别名 build: code=%d stdout=%q", code, stdout)
+		}
+	})
+
 	t.Run("gen 遇到坏数据直接失败", func(t *testing.T) {
 		broken := writeE2ESite(t)
 		writeFile(t, filepath.Join(broken, "templates", "data.json"), `{"site": }`)
 
 		out := filepath.Join(t.TempDir(), "dist")
-		code, _, stderr := runBinary(t, binary, "gen", "--dir", broken, "--out", out)
+		code, _, stderr := runBinaryIn(t, broken, binary, "gen", "--out", out)
 		if code == 0 {
 			t.Fatal("坏 data.json 应当让 gen 失败")
 		}
@@ -381,7 +402,7 @@ func TestE2E(t *testing.T) {
 
 	t.Run("--fingerprint=false 关闭自动版本号", func(t *testing.T) {
 		out := filepath.Join(t.TempDir(), "dist")
-		code, _, stderr := runBinary(t, binary, "gen", "--dir", writeE2ESite(t), "--out", out, "--fingerprint=false")
+		code, _, stderr := runBinaryIn(t, writeE2ESite(t), binary, "gen", "--out", out, "--fingerprint=false")
 		if code != 0 {
 			t.Fatalf("gen 退出码 = %d，期望 0（stderr: %s）", code, stderr)
 		}
@@ -398,13 +419,92 @@ func TestE2E(t *testing.T) {
 	t.Run("--build-time 可固定构建时间", func(t *testing.T) {
 		// 用独立站点：共享站点在服务端子测试里被改坏过模板。
 		out := filepath.Join(t.TempDir(), "dist")
-		code, _, stderr := runBinary(t, binary, "gen", "--dir", writeE2ESite(t), "--out", out,
+		code, _, stderr := runBinaryIn(t, writeE2ESite(t), binary, "gen", "--out", out,
 			"--build-time", "2026-03-05T10:30:00Z")
 		if code != 0 {
 			t.Fatalf("gen 退出码 = %d，期望 0（stderr: %s）", code, stderr)
 		}
 		if index := readFile(t, filepath.Join(out, "index.html")); !strings.Contains(index, "2026-03-05") {
 			t.Fatalf("产物未使用固定的构建时间: %s", index)
+		}
+	})
+
+	t.Run("serve 自动打开浏览器（默认开、--open=false 关）", func(t *testing.T) {
+		recorder := buildRecorder(t)
+		siteDir := writeE2ESite(t)
+
+		// 默认开启：serve 应调用我们指定的打开命令，并把真实监听地址传给它。
+		opened := filepath.Join(t.TempDir(), "opened.txt")
+		server := startServeEnv(t, binary, siteDir,
+			[]string{openCommandEnv + "=" + recorder, "RECORDER_OUT=" + opened})
+		waitFor(t, e2eStartupTimeout, func() bool {
+			body, err := os.ReadFile(opened)
+			return err == nil && strings.TrimSpace(string(body)) == server.url+"/"
+		}, "应把真实地址 "+server.url+"/ 交给打开命令")
+		if logs := server.logs(); !strings.Contains(logs, "open=true") {
+			t.Fatalf("启动日志应标明 open=true: %s", logs)
+		}
+
+		// --open=false：不调用打开命令（等一会，确保不是慢半拍）。
+		silent := filepath.Join(t.TempDir(), "silent.txt")
+		startServeEnv(t, binary, siteDir,
+			[]string{openCommandEnv + "=" + recorder, "RECORDER_OUT=" + silent}, "--open=false")
+		time.Sleep(500 * time.Millisecond)
+		if body, err := os.ReadFile(silent); err == nil {
+			t.Fatalf("--open=false 时不应打开浏览器，实际记录了 %q", strings.TrimSpace(string(body)))
+		}
+	})
+
+	t.Run("三根布局 pages/ + templates/ + static/", func(t *testing.T) {
+		siteDir := writeSite(t, map[string]string{
+			"pages/index.html":       `<html><body>{{template "header" .}}<link rel="stylesheet" href="/static/xxx.css"></body></html>`,
+			"pages/about/index.html": `<html><body><h1>ABOUT</h1></body></html>`,
+			"templates/header.html":  `{{define "header"}}<header>THREE-ROOTS-HEADER</header>{{end}}`,
+			"templates/data.json":    `{"site":{"title":"THREE"}}`,
+			"static/xxx.css":         "body{}",
+			"static/skip.tmp":        "临时文件",
+			".gitignore":             "*.tmp\n",
+			".goweb.yml":             "dir: pages\n",
+		})
+
+		// gen：由配置文件指定页面根，产物落在项目根的 dist/。
+		code, _, stderr := runBinaryIn(t, siteDir, binary, "gen")
+		if code != 0 {
+			t.Fatalf("gen 退出码 = %d，期望 0（stderr: %s）", code, stderr)
+		}
+		out := filepath.Join(siteDir, "dist")
+		want := []string{"about/index.html", "index.html", "static/xxx.css"}
+		if got := listFiles(t, out); !equalStrings(got, want) {
+			t.Fatalf("产物清单 = %v，期望 %v（.gitignore 里的 *.tmp 不应进产物）", got, want)
+		}
+		index := readFile(t, filepath.Join(out, "index.html"))
+		if !strings.Contains(index, "THREE-ROOTS-HEADER") {
+			t.Fatalf("模板根未被加载: %s", index)
+		}
+		if !strings.Contains(index, "/static/xxx.css?v=") {
+			t.Fatalf("资源引用应带内容哈希: %s", index)
+		}
+
+		// serve：同样由配置文件驱动；被忽略的文件本地仍可访问。
+		server := startServe(t, binary, siteDir)
+		client := &http.Client{Timeout: e2eHTTPTimeout}
+
+		cases := []struct {
+			path         string
+			wantStatus   int
+			wantContains string
+		}{
+			{path: "/", wantStatus: 200, wantContains: "THREE-ROOTS-HEADER"},
+			{path: "/about/", wantStatus: 200, wantContains: "ABOUT"},
+			{path: "/static/xxx.css", wantStatus: 200, wantContains: "body{}"},
+			{path: "/static/skip.tmp", wantStatus: 200, wantContains: "临时文件"},
+		}
+		for _, test := range cases {
+			status, body := e2eGet(t, client, server.url+test.path)
+			if status != test.wantStatus || !strings.Contains(body, test.wantContains) {
+				t.Fatalf("GET %s = %d/%q，期望 %d 且包含 %q",
+					test.path, status, body, test.wantStatus, test.wantContains)
+			}
 		}
 	})
 }
@@ -427,11 +527,24 @@ func (s *e2eServer) logs() string {
 
 // startServe 用编译后的二进制起一个开发服务器，等待它打印真实监听地址后返回。
 // 用 --addr 127.0.0.1:0 让内核分配端口，再从日志里取回，避免端口冲突。
+// 常规测试一律关掉自动开浏览器，免得在开发机或 CI 上真的弹窗。
 func startServe(t *testing.T, binary, siteDir string, extraArgs ...string) *e2eServer {
 	t.Helper()
+	return startServeEnv(t, binary, siteDir, nil, append([]string{"--open=false"}, extraArgs...)...)
+}
 
-	args := append([]string{"serve", "--dir", siteDir, "--addr", "127.0.0.1:0"}, extraArgs...)
+// startServeEnv 与 startServe 相同，但可以追加环境变量（例如替换打开浏览器的命令）。
+func startServeEnv(t *testing.T, binary, siteDir string, env []string, extraArgs ...string) *e2eServer {
+	t.Helper()
+
+	// 在站点目录里启动，等价于用户在项目根运行 goweb：
+	// 项目根 = 站点目录，templates/ 与静态资源都在它下面。
+	args := append([]string{"serve", "--addr", "127.0.0.1:0"}, extraArgs...)
 	cmd := exec.Command(binary, args...)
+	cmd.Dir = siteDir
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		t.Fatalf("获取 stderr: %v", err)
@@ -479,7 +592,54 @@ func startServe(t *testing.T, binary, siteDir string, extraArgs ...string) *e2eS
 // runBinary 运行二进制并返回退出码与输出。
 func runBinary(t *testing.T, binary string, args ...string) (int, string, string) {
 	t.Helper()
+	return runBinaryIn(t, "", binary, args...)
+}
+
+// buildRecorder 编译一个极小的记录器：把收到的最后一个参数追加写入 RECORDER_OUT 指向的文件。
+// 把它设成 GOWEB_OPEN_COMMAND，就能验证「serve 真的用真实监听地址拉起了打开命令」，
+// 又不会真的弹出浏览器窗口；用 Go 程序而不是 shell 脚本，三个平台都能跑。
+func buildRecorder(t *testing.T) string {
+	t.Helper()
+
+	const source = `package main
+
+import "os"
+
+func main() {
+	file, err := os.OpenFile(os.Getenv("RECORDER_OUT"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		os.Exit(1)
+	}
+	defer file.Close()
+	if _, err := file.WriteString(os.Args[len(os.Args)-1] + "\n"); err != nil {
+		os.Exit(1)
+	}
+}
+`
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "main.go"), source)
+	writeFile(t, filepath.Join(dir, "go.mod"), "module opener-recorder\n\ngo 1.26\n")
+
+	binary := filepath.Join(dir, "recorder")
+	if runtime.GOOS == "windows" {
+		binary += ".exe"
+	}
+	build := exec.Command("go", "build", "-o", binary, ".")
+	build.Dir = dir
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("编译记录器失败: %v\n%s", err, out)
+	}
+	return binary
+}
+
+// runBinaryIn 在指定工作目录里运行二进制（空串表示沿用当前目录）。
+// 站点类命令要在站点目录里跑：项目根 = 站点目录。
+func runBinaryIn(t *testing.T, dir, binary string, args ...string) (int, string, string) {
+	t.Helper()
 	cmd := exec.Command(binary, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 

@@ -277,3 +277,46 @@ func TestGenerateFailsWhenTargetIsDirectory(t *testing.T) {
 		t.Fatal("拷贝目标被目录占用时应当报错")
 	}
 }
+
+// TestGenCommandOutDirBoundary 从 CLI 层锁定产物目录排除的边界（用户明确选择的方案 A）：
+//   - 「当前 --out 指定的产物目录」会被自动排除，连跑两次也不会自我嵌套；
+//   - 换过产物目录后，旧产物目录仍属于资源根，会被当普通资源拷进新产物。
+//
+// 因此约定是把产物目录写进 .gitignore / 配置里的 ignore；若哪天改成自动排除旧产物目录，
+// 要同步改这条测试与文档。
+func TestGenCommandOutDirBoundary(t *testing.T) {
+	dir := writeSite(t, map[string]string{
+		"index.html":   "<html>INDEX</html>",
+		"static/a.css": "body{}",
+	})
+
+	// 连跑两次默认 gen：第二次 dist/ 里已有内容，仍然不能把自己拷进自己。
+	for attempt := 1; attempt <= 2; attempt++ {
+		if _, stderr, err := executeCLIInSite(t, dir, "gen"); err != nil {
+			t.Fatalf("第 %d 次 gen: %v（stderr: %s）", attempt, err, stderr)
+		}
+	}
+	out := filepath.Join(dir, "dist")
+	want := []string{"index.html", "static/a.css"}
+	if got := listFiles(t, out); !equalStrings(got, want) {
+		t.Fatalf("产物清单 = %v，期望 %v（不应出现自我嵌套）", got, want)
+	}
+
+	// 换产物目录：dist/ 不再是「当前 --out」，按资源被拷进 d2。
+	if _, stderr, err := executeCLIInSite(t, dir, "gen", "--out", "d2"); err != nil {
+		t.Fatalf("gen --out d2: %v（stderr: %s）", err, stderr)
+	}
+	if got := listFiles(t, filepath.Join(dir, "d2")); !containsString(got, "dist/index.html") {
+		t.Fatalf("方案 A 下旧产物目录应被当资源拷贝，实际 = %v", got)
+	}
+}
+
+// containsString 判断切片里是否有该元素（测试断言用）。
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}

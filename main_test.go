@@ -98,7 +98,7 @@ func TestGenCommandGenerates(t *testing.T) {
 	})
 	out := filepath.Join(t.TempDir(), "out")
 
-	_, stderr, err := executeCLI("gen", "--dir", siteDir, "--out", out)
+	_, stderr, err := executeCLIInSite(t, siteDir, "gen", "--out", out)
 	if err != nil {
 		t.Fatalf("gen 出错: %v（stderr: %s）", err, stderr)
 	}
@@ -118,12 +118,57 @@ func TestGenCommandGenerates(t *testing.T) {
 	}
 }
 
-// TestGlobalFlagsCanPrecedeSubcommand 覆盖 `goweb --dir X gen`：持久参数写在子命令之前也要生效。
+// TestBuildAliasEqualsGen 覆盖 gen 的别名 build：CLI 结构上有别名，行为与 gen 完全一致。
+func TestBuildAliasEqualsGen(t *testing.T) {
+	root := newRootCommand()
+	genCmd, _, err := root.Find([]string{"gen"})
+	if err != nil {
+		t.Fatalf("查找 gen: %v", err)
+	}
+	if !equalStrings(genCmd.Aliases, []string{"build"}) {
+		t.Fatalf("gen 的别名 = %v，期望 [build]", genCmd.Aliases)
+	}
+	// 别名要能被解析到同一个命令（cobra 的 Find 会走别名匹配）。
+	aliased, args, err := root.Find([]string{"build", "--out", "public"})
+	if err != nil {
+		t.Fatalf("解析 build: %v", err)
+	}
+	if aliased != genCmd {
+		t.Fatalf("build 应解析到 gen 命令，实际 %s", aliased.Name())
+	}
+	if !equalStrings(args, []string{"--out", "public"}) {
+		t.Fatalf("别名后的参数应原样保留，实际 %v", args)
+	}
+
+	t.Run("行为与 gen 一致", func(t *testing.T) {
+		siteDir := writeSite(t, map[string]string{
+			"index.html":          `<html>INDEX {{.site.title}}</html>`,
+			"templates/data.json": `{"site":{"title":"ALIAS"}}`,
+		})
+		out := filepath.Join(t.TempDir(), "built")
+		_, stderr, err := executeCLIInSite(t, siteDir, "build", "--out", out)
+		if err != nil {
+			t.Fatalf("build 出错: %v（stderr: %s）", err, stderr)
+		}
+		if !strings.Contains(stderr, "静态站已生成") {
+			t.Fatalf("缺少生成日志: %s", stderr)
+		}
+		if body := readFile(t, filepath.Join(out, "index.html")); !strings.Contains(body, "ALIAS") {
+			t.Fatalf("产物内容不正确: %s", body)
+		}
+		// 别名与 gen 一样是 prod 模式（--mode auto 下按产出方向取默认值）。
+		if !strings.Contains(stderr, "mode=prod") {
+			t.Fatalf("build 应与 gen 一样默认 prod 模式: %s", stderr)
+		}
+	})
+}
+
+// TestGlobalFlagsCanPrecedeSubcommand 覆盖 `goweb --dir . gen`：持久参数写在子命令之前也要生效。
 func TestGlobalFlagsCanPrecedeSubcommand(t *testing.T) {
 	siteDir := writeSite(t, map[string]string{"index.html": "<html>INDEX</html>"})
 	out := filepath.Join(t.TempDir(), "out")
 
-	_, stderr, err := executeCLI("--dir", siteDir, "gen", "--out", out)
+	_, stderr, err := executeCLIInSite(t, siteDir, "--dir", ".", "gen", "--out", out)
 	if err != nil {
 		t.Fatalf("gen 出错: %v（stderr: %s）", err, stderr)
 	}
@@ -137,21 +182,21 @@ func TestGenCommandCleanFlag(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "out")
 	stale := filepath.Join(out, "stale.html")
 
-	if _, _, err := executeCLI("gen", "--dir", siteDir, "--out", out); err != nil {
+	if _, _, err := executeCLIInSite(t, siteDir, "gen", "--out", out); err != nil {
 		t.Fatalf("首次生成: %v", err)
 	}
 	if err := os.WriteFile(stale, []byte("stale"), 0o644); err != nil {
 		t.Fatalf("写入遗留文件: %v", err)
 	}
 
-	if _, _, err := executeCLI("gen", "--dir", siteDir, "--out", out, "--clean=false"); err != nil {
+	if _, _, err := executeCLIInSite(t, siteDir, "gen", "--out", out, "--clean=false"); err != nil {
 		t.Fatalf("--clean=false 生成: %v", err)
 	}
 	if _, err := os.Stat(stale); err != nil {
 		t.Fatalf("--clean=false 不应删除遗留文件: %v", err)
 	}
 
-	if _, _, err := executeCLI("gen", "--dir", siteDir, "--out", out, "--clean"); err != nil {
+	if _, _, err := executeCLIInSite(t, siteDir, "gen", "--out", out, "--clean"); err != nil {
 		t.Fatalf("--clean 生成: %v", err)
 	}
 	if _, err := os.Stat(stale); err == nil {
@@ -171,12 +216,13 @@ func TestCommandErrors(t *testing.T) {
 		{name: "未知子命令", args: []string{"bogus"}, want: "unknown command"},
 		{name: "未知 flag", args: []string{"gen", "--bogus"}, want: "unknown flag"},
 		{name: "多余位置参数", args: []string{"gen", "extra"}, want: "unknown command"},
-		{name: "产物目录护栏", args: []string{"gen", "--dir", siteDir, "--out", siteDir}, want: "产物目录"},
+		{name: "产物目录护栏", args: []string{"gen", "--out", "."}, want: "产物目录"},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, stderr, err := executeCLI(test.args...)
+			// 在站点目录里运行：项目根 = 站点目录，--out . 即把项目根当产物目录。
+			_, stderr, err := executeCLIInSite(t, siteDir, test.args...)
 			if err == nil {
 				t.Fatalf("%v 应当报错", test.args)
 			}
@@ -194,7 +240,7 @@ func TestRuntimeErrorKeepsErrorPrefixAndSkipsUsage(t *testing.T) {
 		"templates/data.json": `{"broken": }`,
 	})
 
-	_, stderr, err := executeCLI("gen", "--dir", siteDir)
+	_, stderr, err := executeCLIInSite(t, siteDir, "gen")
 	if err == nil {
 		t.Fatal("坏 data.json 应当报错")
 	}
@@ -214,7 +260,7 @@ func TestRootWithoutSubcommandRunsServe(t *testing.T) {
 		"templates/data.json": `{"broken": }`,
 	})
 
-	_, _, err := executeCLI("--dir", siteDir)
+	_, _, err := executeCLIInSite(t, siteDir)
 	if err == nil {
 		t.Fatal("根命令应当执行 serve 并因坏数据失败")
 	}
@@ -256,6 +302,18 @@ func TestCommandFlagDefaults(t *testing.T) {
 		if got, err := cmd.Flags().GetBool("livereload"); err != nil || !got {
 			t.Fatalf("%s --livereload 默认值 = %v（err=%v），期望 true", name, got, err)
 		}
+		// 自动打开浏览器同样默认开启，用 --open=false 关闭。
+		if got, err := cmd.Flags().GetBool("open"); err != nil || !got {
+			t.Fatalf("%s --open 默认值 = %v（err=%v），期望 true", name, got, err)
+		}
+	}
+
+	// gen 不该有这两个开发期开关（避免被静默接受）。
+	if flag := serveCmd(t, root).Flags().Lookup("open"); flag == nil {
+		t.Fatal("serve 应提供 --open")
+	}
+	if genCmd := func() *cobra.Command { cmd, _, _ := root.Find([]string{"gen"}); return cmd }(); genCmd.Flags().Lookup("open") != nil {
+		t.Fatal("gen 不应提供 --open")
 	}
 }
 
@@ -292,7 +350,7 @@ func TestGenWithoutTemplateDir(t *testing.T) {
 	})
 	out := filepath.Join(t.TempDir(), "out")
 
-	if _, stderr, err := executeCLI("gen", "--dir", siteDir, "--template", "", "--out", out); err != nil {
+	if _, stderr, err := executeCLIInSite(t, siteDir, "gen", "--template", "", "--out", out); err != nil {
 		t.Fatalf("gen 出错: %v（stderr: %s）", err, stderr)
 	}
 	if got := readFile(t, filepath.Join(out, "index.html")); got != "<html></html>" {
@@ -356,7 +414,7 @@ func TestHelpGoesToStdout(t *testing.T) {
 func TestServeFailsOnInvalidAddr(t *testing.T) {
 	siteDir := writeSite(t, map[string]string{"index.html": "<html>INDEX</html>"})
 
-	_, _, err := executeCLI("serve", "--dir", siteDir, "--addr", "127.0.0.1:-1")
+	_, _, err := executeCLIInSite(t, siteDir, "serve", "--addr", "127.0.0.1:-1")
 	if err == nil {
 		t.Fatal("非法监听地址应当报错")
 	}
