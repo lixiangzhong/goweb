@@ -37,8 +37,10 @@ go test -short -cover ./...   # 覆盖率
 | `roots_test.go` | `LoadSite`（三根）与 CLI 配置链路 | 三个根与项目根解析（含向上查找、`--config` 显式路径、模板根在项目根之外）、产物映射与冲突报错、忽略规则只作用于 gen、`.goweb.yml` 优先级与未知字段 |
 | `gitignore_test.go` | `ignoreMatcher` | 模式子集语义，并与真实 `git check-ignore` 在同一批路径上逐条对拍 |
 | `fingerprint_test.go` | `fingerprintHTML` | 属性白名单、跳过规则（外链/`data:`/页面/模板/已带查询串）、相对路径、`srcset`、无改动时逐字节保真、与 `{{asset}}` 同哈希 |
+| `minify_test.go` | `minifyBytes` / `Generate`（Minify） | 扩展名映射、页面与资源的压缩、`<pre>`/内联元素空格逐字节保真、JS 不改变量名、`/*!` 许可声明保留、不可压缩文件字节一致 |
 | `gen_test.go` | `Generate` | 产物树、资源拷贝（嵌套目录/符号链接/忽略项）、清空护栏、快速失败、错误路径 |
-| `serve_test.go` | `newHandler` / `watchSite` | 状态码与响应头、访问日志、渲染失败回 500、fsnotify 重载与失败韧性、新增文件被发现、热重载注入范围与广播时机 |
+| `listen_test.go` | `listenWithFallback` / `nextPort` | 端口递增规则（主机不变、`:0`/非法端口不递增）、真实 socket 上的落位、显式端口快速失败、非占用错误不被掩盖、连续端口耗尽 |
+| `serve_test.go` | `newHandler` / `watchSite` / `selfOutputFiles` | 状态码与响应头、访问日志、渲染失败回 500、fsnotify 重载与失败韧性、新增文件被发现、热重载注入范围与广播时机 |
 | `livereload_test.go` | `liveReloadHub` / `injectLiveReload` | 脚本注入位置（`</body>` 前/追加/大小写）、订阅与注销、慢客户端不阻塞广播 |
 | `open_test.go` | `browserURL` / `browserCommand` / `openInBrowser` | 监听地址到浏览器地址的推导（通配→localhost、IPv6 方括号）、三平台命令与 `GOWEB_OPEN_COMMAND` 覆盖、打开失败只记日志不影响服务 |
 | `main_test.go` | cobra 命令树 | 参数默认值与短选项、公共参数前置、错误前缀与 usage、`--version` 注入 |
