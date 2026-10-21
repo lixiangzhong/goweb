@@ -579,3 +579,19 @@ func TestLoggerUsesReadableTimeFormat(t *testing.T) {
 		t.Fatalf("日志其余部分 = %q，期望 %q", rest, want)
 	}
 }
+
+// TestEffectiveVersion 覆盖版本号来源：-ldflags 注入优先，没有注入时回退到构建信息里的模块版本，
+// 本地 go build/go test 的模块版本是 "(devel)"，最终回退到 "dev"。
+func TestEffectiveVersion(t *testing.T) {
+	original := version
+	t.Cleanup(func() { version = original })
+
+	version = "dev"
+	if got := effectiveVersion(); got != "dev" {
+		t.Fatalf("本地构建（模块版本为 devel）应回退 dev，实际 %q", got)
+	}
+	version = "v9.9.9-test"
+	if got := effectiveVersion(); got != "v9.9.9-test" {
+		t.Fatalf("-ldflags 注入的值应优先，实际 %q", got)
+	}
+}

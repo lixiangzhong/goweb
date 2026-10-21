@@ -83,8 +83,7 @@ func isAddressInUse(err error) bool {
 	if errors.Is(err, syscall.EADDRINUSE) {
 		return true
 	}
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
+	if errno, ok := errors.AsType[syscall.Errno](err); ok {
 		return uintptr(errno) == wsaEADDRINUSE
 	}
 	return false

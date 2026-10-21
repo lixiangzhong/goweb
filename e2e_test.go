@@ -37,6 +37,9 @@ const (
 	e2eHTTPTimeout = 5 * time.Second
 )
 
+// e2eInjectedVersion 是端到端测试编译时注入的版本号，用于断言 --version 走的是注入值。
+const e2eInjectedVersion = "e2e-injected-version"
+
 // e2eAddrRe 匹配服务端启动日志里的真实监听地址（含 IPv6 通配写法如 [::]:8081）。
 var e2eAddrRe = regexp.MustCompile(`addr=(\S+)`)
 
@@ -48,7 +51,9 @@ func buildGoweb(t *testing.T) string {
 		name += ".exe"
 	}
 	binary := filepath.Join(t.TempDir(), name)
-	cmd := exec.Command("go", "build", "-o", binary, ".")
+	// 显式注入版本号：一是让 --version 的断言确定（否则 Go 会给 git 仓库里的本地构建
+	// 盖上 v0.2.0+dirty 之类的版本戳），二是端到端验证 -ldflags 注入这条路径。
+	cmd := exec.Command("go", "build", "-ldflags", "-X main.version="+e2eInjectedVersion, "-o", binary, ".")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("编译 goweb 失败: %v\n%s", err, out)
 	}
@@ -425,7 +430,7 @@ func TestE2E(t *testing.T) {
 	})
 
 	t.Run("版本 帮助 补全可用", func(t *testing.T) {
-		if code, stdout, stderr := runBinary(t, binary, "--version"); code != 0 || !strings.Contains(stdout, version) {
+		if code, stdout, stderr := runBinary(t, binary, "--version"); code != 0 || !strings.Contains(stdout, e2eInjectedVersion) {
 			t.Fatalf("--version 异常: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 		}
 		if code, stdout, _ := runBinary(t, binary, "help"); code != 0 ||

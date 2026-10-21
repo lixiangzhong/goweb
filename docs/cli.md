@@ -81,7 +81,7 @@ ignore:               # 额外忽略模式（与 .gitignore 同语法，只作�
 | `--build-time` | — | 全部 | 空（取站点最新修改时间） | 模板里的构建时间，RFC3339 或 `2006-01-02` |
 | `--force` | — | init | `false` | 覆盖已存在的配置文件 |
 | `--links` | — | check | `true` | 检查渲染结果里的站内链接；`--links=false` 关闭 |
-| `--version` | `-v` | 根命令（`goweb --version`） | — | 打印版本号（`dev`，除非构建时用 `-ldflags` 注入） |
+| `--version` | `-v` | 根命令（`goweb --version`） | — | 打印版本号：优先 `-ldflags` 注入（发布包），其次嵌入的模块版本（`go install …@v0.2.0`），本地 `go build` 则为 `dev` |
 | `--help` | `-h` | 全部 | — | 查看帮助，如 `goweb gen --help` |
 
 ### 日志格式

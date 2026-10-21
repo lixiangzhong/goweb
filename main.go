@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -28,8 +29,24 @@ const (
 	modeAuto = "auto"
 )
 
-// version 是版本号，构建时可通过 -ldflags "-X main.version=v1.0.0" 注入。
+// version 是版本号，构建时可通过 -ldflags "-X main.version=v1.0.0" 注入（发布包就是这么做的）。
 var version = "dev"
+
+// effectiveVersion 给出要展示的版本号：
+//  1. -ldflags 注入的值（发布包走这条）；
+//  2. 否则回退到构建信息里的模块版本——`go install github.com/lixiangzhong/goweb@v0.2.0`
+//     不会注入 ldflags，但会把模块版本写进二进制，取出来才对得上用户装的东西；
+//  3. 本地 `go build` 时模块版本是 "(devel)"，此时依旧是 "dev"。
+func effectiveVersion() string {
+	if version != "" && version != "dev" {
+		return version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok || info.Main.Version == "" || info.Main.Version == "(devel)" {
+		return version
+	}
+	return info.Main.Version
+}
 
 // globalOptions 是根命令与各子命令共用的参数（persistent flag）。
 type globalOptions struct {
@@ -69,7 +86,7 @@ func newRootCommand() *cobra.Command {
 		Short:   "面向前端开发的静态站服务器与静态化工具",
 		Long:    rootLongDescription,
 		Example: rootExample,
-		Version: version,
+		Version: effectiveVersion(),
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// 参数已解析完成，运行期错误不再刷 usage。
