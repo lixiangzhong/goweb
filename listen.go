@@ -50,7 +50,6 @@ func listenWithFallbackN(addr string, allowIncrement bool, attempts int, logger 
 		if !isAddressInUse(attemptErr) {
 			return nil, attemptErr
 		}
-		err = attemptErr
 	}
 
 	return nil, fmt.Errorf("从 %s 起的 %d 个端口都被占用（最后尝试 %s）：%w",

@@ -112,9 +112,10 @@ func (h *handler) serveLiveReload(w http.ResponseWriter, r *http.Request) {
 }
 
 // injectLiveReload 把热重载脚本插到最后一个 </body> 之前；没有 body 结束标签时追加到末尾。
+// 匹配忽略大小写，但不用 bytes.ToLower：Unicode 小写映射可能改变字节长度
+// （例如 U+0130、U+212A），导致索引错位，把脚本插进正文中间。
 func injectLiveReload(body []byte, snippet string) []byte {
-	lowered := bytes.ToLower(body)
-	index := bytes.LastIndex(lowered, []byte("</body>"))
+	index := lastIndexFold(body, "</body>")
 
 	injected := make([]byte, 0, len(body)+len(snippet))
 	if index < 0 {
@@ -124,4 +125,16 @@ func injectLiveReload(body []byte, snippet string) []byte {
 	injected = append(injected, body[:index]...)
 	injected = append(injected, snippet...)
 	return append(injected, body[index:]...)
+}
+
+// lastIndexFold 返回 needle 在 haystack 中最后一次出现的位置（ASCII 大小写不敏感）。
+// needle 只用于固定的结束标签，按字节等长比较即可。
+func lastIndexFold(haystack []byte, needle string) int {
+	target := []byte(needle)
+	for start := len(haystack) - len(target); start >= 0; start-- {
+		if bytes.EqualFold(haystack[start:start+len(target)], target) {
+			return start
+		}
+	}
+	return -1
 }

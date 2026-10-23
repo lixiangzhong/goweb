@@ -590,8 +590,10 @@ func TestE2E(t *testing.T) {
 			}
 
 			writeFile(t, filepath.Join(siteDir, "about.html"), "<html>{{template ")
-			// 等防抖窗口 + 一次失败的重载
-			time.Sleep(500 * time.Millisecond)
+			// 等一次失败的重载真正发生后，再断言页面内容未被替换。
+			waitFor(t, e2eStartupTimeout, func() bool {
+				return strings.Contains(server.logs(), "站点重载失败")
+			}, "坏模板应触发一次失败的重载")
 
 			status, body := e2eGet(t, client, server.url+"/about")
 			if status != 200 || body != expected {
@@ -671,11 +673,12 @@ func TestE2E(t *testing.T) {
 			t.Fatalf("启动日志应标明 open=true: %s", logs)
 		}
 
-		// --open=false：不调用打开命令（等一会，确保不是慢半拍）。
+		// --open=false：不调用打开命令。打开动作发生在 server.Serve 之前，
+		// 因此等 HTTP 真正可用后即可确定「打开」分支没有执行，无需固定 sleep。
 		silent := filepath.Join(t.TempDir(), "silent.txt")
-		startServeEnv(t, binary, siteDir,
+		quiet := startServeEnv(t, binary, siteDir,
 			[]string{openCommandEnv + "=" + recorder, "RECORDER_OUT=" + silent}, "--open=false")
-		time.Sleep(500 * time.Millisecond)
+		waitForBody(t, http.DefaultClient, quiet.url+"/", "<h1>INDEX</h1>")
 		if body, err := os.ReadFile(silent); err == nil {
 			t.Fatalf("--open=false 时不应打开浏览器，实际记录了 %q", strings.TrimSpace(string(body)))
 		}

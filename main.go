@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	// defaultAddr 是开发服务器默认监听地址。
-	defaultAddr = ":8080"
+	// defaultAddr 是开发服务器默认监听地址：只监听本机回环口，
+	// 不把「整个项目目录 + 模板渲染」默认暴露到局域网。
+	defaultAddr = "127.0.0.1:8080"
 	// defaultPageDir 是默认页面目录，即运行目录。
 	defaultPageDir = "."
 	// defaultTemplateDir 是默认模板根（全局模板与 data.json 所在目录），相对项目根。
@@ -64,6 +65,10 @@ type globalOptions struct {
 	buildTime string
 	// fingerprint 表示是否给页面里的站内资源引用自动补 ?v=<内容哈希>。
 	fingerprint bool
+	// gitignore 表示是否读取项目根的 .gitignore 作为忽略规则（只作用于 gen/check）。
+	gitignore bool
+	// ignore 是命令行追加的忽略模式（与 .gitignore 同语法），会接在配置 ignore 之后。
+	ignore []string
 }
 
 // main 只负责退出码：命令树、错误信息与 usage 都由 cobra 处理。
@@ -232,6 +237,10 @@ func addGlobalFlags(cmd *cobra.Command, globals *globalOptions) {
 		"模板里的构建时间（RFC3339 或 2006-01-02）；留空则取站点内容里最新的文件修改时间")
 	flags.BoolVar(&globals.fingerprint, "fingerprint", true,
 		"给页面里的站内静态资源引用自动补 ?v=<内容哈希>，用于缓存失效；关闭后输出不做任何改写")
+	flags.BoolVar(&globals.gitignore, "gitignore", true,
+		"读取项目根的 .gitignore 作为忽略规则（只作用于 gen/check；serve 仍可访问被忽略的文件）")
+	flags.StringArrayVar(&globals.ignore, "ignore", nil,
+		"额外忽略模式（与 .gitignore 同语法，可重复；只作用于 gen/check，追加在配置 ignore 之后）")
 }
 
 // resolveMode 把 --mode 的取值解析成实际模式：auto 时 serve 用 dev、gen 用 prod。
@@ -297,6 +306,9 @@ func runServe(cmd *cobra.Command, opts serveOptions) error {
 	site, err := LoadSite(resolved.siteOptions([]string{resolved.out}, false))
 	if err != nil {
 		return err
+	}
+	if len(site.Pages()) == 0 {
+		logger.Warn("没有发现任何页面，检查 --dir 是否指向页面根", "pagesRoot", site.PagesRoot())
 	}
 
 	// 热重载：站点重载成功后广播给所有已连接的浏览器页面。
@@ -398,10 +410,7 @@ func runCheck(cmd *cobra.Command, globals *globalOptions, opts checkOptions) err
 		Logger: logger,
 	})
 
-	problems := make([]string, 0, 8)
-	if err != nil {
-		problems = append(problems, strings.Split(err.Error(), "\n")...)
-	}
+	problems := renderProblems(err)
 	if checker != nil {
 		problems = append(problems, checker.issues()...)
 	}
@@ -424,6 +433,32 @@ func runCheck(cmd *cobra.Command, globals *globalOptions, opts checkOptions) err
 	return nil
 }
 
+// renderProblems 把 Generate 返回的问题拆成「一条一行」的列表项：
+// errors.Join 里的每个错误单独成条，错误内部的换行缩进成续行，
+// 避免多行错误（例如产物冲突的两条来源说明）被拆成多条独立问题。
+func renderProblems(err error) []string {
+	if err == nil {
+		return nil
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var lines []string
+		for _, single := range joined.Unwrap() {
+			lines = append(lines, formatProblem(single)...)
+		}
+		return lines
+	}
+	return formatProblem(err)
+}
+
+// formatProblem 把单个错误改成列表项：首行保持原样，续行缩进对齐。
+func formatProblem(err error) []string {
+	lines := strings.Split(err.Error(), "\n")
+	for i := 1; i < len(lines); i++ {
+		lines[i] = "    " + lines[i]
+	}
+	return lines
+}
+
 // runGen 渲染全部页面并产出纯静态站。
 func runGen(cmd *cobra.Command, opts genOptions) error {
 	logger := newLogger(cmd.ErrOrStderr())
@@ -441,6 +476,9 @@ func runGen(cmd *cobra.Command, opts genOptions) error {
 	if err != nil {
 		return err
 	}
+	if len(site.Pages()) == 0 {
+		logger.Warn("没有发现任何页面，检查 --dir 是否指向页面根", "pagesRoot", site.PagesRoot())
+	}
 
 	result, err := Generate(site, GenOptions{
 		Out: out, Clean: opts.clean, Minify: resolved.minify, Logger: logger,
@@ -455,7 +493,8 @@ func runGen(cmd *cobra.Command, opts genOptions) error {
 		"data", site.DataFile(),
 		"mode", site.Mode(),
 		"buildTime", site.BuildTime().Format(time.RFC3339),
-		"fingerprint", opts.globals.fingerprint,
+		"fingerprint", resolved.fingerprint,
+		"minify", resolved.minify,
 	)
 	return nil
 }
@@ -491,7 +530,7 @@ const rootLongDescription = `goweb 用四个子命令覆盖「初始化配置 �
 
 不带子命令时等价于 serve，直接在当前目录起开发服务器。
 
-监听端口（--addr，默认 :8080）：
+监听端口（--addr，默认 127.0.0.1:8080，只监听本机）：
   没有显式指定端口时，8080 被占用会自动依次尝试 8081…8089，并在日志里说明；
   显式写 --addr 或在配置里写 addr 就表示「我就要这个端口」，被占用时直接报错退出。
 

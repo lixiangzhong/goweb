@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 )
@@ -179,11 +178,4 @@ func TestIgnoreMatcherEmpty(t *testing.T) {
 	if empty.Match("a.log", false) {
 		t.Fatal("空规则集不应忽略任何路径")
 	}
-}
-
-// sortStrings 供其它测试复用。
-func sortStrings(values []string) []string {
-	sorted := append([]string(nil), values...)
-	sort.Strings(sorted)
-	return sorted
 }

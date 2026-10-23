@@ -231,8 +231,8 @@ func resolveSettings(cmd *cobra.Command, globals *globalOptions, local localFlag
 		liveReload:   pickBool(local.liveReload, changed("livereload"), config.LiveReload, true),
 		open:         pickBool(local.open, changed("open"), config.Open, true),
 		addr:         pickString(local.addr, changed("addr"), config.Addr, defaultAddr),
-		useGitignore: pickBool(false, false, config.Gitignore, true),
-		ignore:       config.Ignore,
+		useGitignore: pickBool(globals.gitignore, changed("gitignore"), config.Gitignore, true),
+		ignore:       mergeIgnorePatterns(config.Ignore, globals.ignore),
 	}
 
 	// 「显式指定端口」= 命令行给了 --addr，或配置文件里写了 addr。
@@ -249,6 +249,18 @@ func resolveSettings(cmd *cobra.Command, globals *globalOptions, local localFlag
 	}
 
 	return resolved, nil
+}
+
+// mergeIgnorePatterns 合并配置里的 ignore 与命令行 --ignore：配置在前、命令行在后。
+// 两者的关系是追加而不是覆盖：命令行不该让项目级忽略规则整体失效。
+func mergeIgnorePatterns(configPatterns, flagPatterns []string) []string {
+	if len(flagPatterns) == 0 {
+		return configPatterns
+	}
+	merged := make([]string, 0, len(configPatterns)+len(flagPatterns))
+	merged = append(merged, configPatterns...)
+	merged = append(merged, flagPatterns...)
+	return merged
 }
 
 // siteOptions 把解析后的设置转成 SiteOptions。

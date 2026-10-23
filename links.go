@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"net/url"
 	"path"
 	"path/filepath"
 	"sort"
@@ -19,13 +20,22 @@ type linkChecker struct {
 	site *Site
 	// problemPages 记录 URL -> 出现过的页面集合。
 	problemPages map[string]map[string]bool
+	// ignoredTargets 记录「目标存在但被忽略规则排除」的 URL，用于给出更准确的原因。
+	ignoredTargets map[string]bool
+	// writtenValues 记录相对链接在页面里的原始写法（URL -> 写法），便于把问题定位到页面源码。
+	writtenValues map[string]string
 	// checked 统计校验过的站内链接数量。
 	checked int
 }
 
 // newLinkChecker 构造链接校验器。
 func newLinkChecker(site *Site) *linkChecker {
-	return &linkChecker{site: site, problemPages: make(map[string]map[string]bool)}
+	return &linkChecker{
+		site:           site,
+		problemPages:   make(map[string]map[string]bool),
+		ignoredTargets: make(map[string]bool),
+		writtenValues:  make(map[string]string),
+	}
 }
 
 // checkPage 收集并校验一页渲染结果里的站内链接，签名与 GenOptions.OnPage 一致。
@@ -79,19 +89,58 @@ func (c *linkChecker) checkURL(pageDir, pageName, raw string) {
 	if urlPath == "" {
 		return
 	}
+	// 浏览器先把 URL 路径做百分号解码再找文件，校验也必须解码，
+	// 否则 /static/a%20b.css 会被误判成「产物里不存在」。
+	if decoded, err := url.PathUnescape(urlPath); err == nil {
+		urlPath = decoded
+	}
+
 	relative := strings.TrimPrefix(urlPath, "/")
-	if !strings.HasPrefix(value, "/") && pageDir != "" && pageDir != "." {
-		relative = path.Join(pageDir, relative)
+	absolute := strings.HasPrefix(value, "/")
+	var candidates []string
+	if absolute || pageDir == "" || pageDir == "." {
+		candidates = append(candidates, relative)
+	} else {
+		candidates = append(candidates, path.Join(pageDir, relative))
+	}
+
+	// index 页既能用 /dir/ 访问，也能用 /dir 访问；后者在浏览器里把 /dir 当作文件，
+	// 相对链接的基准是它的上一级目录（/）。少校验这一遍，check 会放过
+	// 「以 /dir 打开时断链」的相对链接。
+	if !absolute && strings.HasSuffix(pageName, "/"+indexName) {
+		urlDir := path.Dir(path.Dir("/" + pageName)) // 例：a/b/index -> /a
+		candidates = append(candidates, strings.TrimPrefix(path.Join(urlDir, relative), "/"))
 	}
 
 	c.checked++
-	if c.site.urlIsPublished("/" + relative) {
+	missingURL := ""
+	for _, candidate := range candidates {
+		if !c.site.urlIsPublished("/" + candidate) {
+			missingURL = "/" + candidate
+			break
+		}
+	}
+	if missingURL == "" {
 		return
 	}
-	if c.problemPages[value] == nil {
-		c.problemPages[value] = make(map[string]bool)
+	// 目标文件存在却不在产物里，通常是忽略规则（.gitignore / ignore）把它排除了；
+	// 单独标注原因，比笼统的「不存在」更容易定位。
+	for _, candidate := range candidates {
+		if file, ok := c.site.findSourceFile(candidate); ok && c.site.ignoredForOutput(file, false) {
+			c.ignoredTargets[missingURL] = true
+			break
+		}
 	}
-	c.problemPages[value][pageName] = true
+	if c.problemPages[missingURL] == nil {
+		c.problemPages[missingURL] = make(map[string]bool)
+	}
+	c.problemPages[missingURL][pageName] = true
+	// 相对链接的失败 URL 与页面里的写法不同，记下原始写法方便回查源码。
+	if value != missingURL && value != strings.TrimPrefix(missingURL, "/") {
+		if _, ok := c.writtenValues[missingURL]; !ok {
+			c.writtenValues[missingURL] = value
+		}
+	}
 }
 
 // issues 返回排序后的问题清单，每条包含坏 URL 与出现过的页面。
@@ -109,8 +158,17 @@ func (c *linkChecker) issues() []string {
 			pages = append(pages, page)
 		}
 		sort.Strings(pages)
-		issues = append(issues, fmt.Sprintf("链接在产物里不存在：%s（出现在 %s）",
-			url, strings.Join(pages, "、")))
+		reason := "链接在产物里不存在"
+		if c.ignoredTargets[url] {
+			reason = "链接指向被忽略规则排除的文件"
+		}
+		if written := c.writtenValues[url]; written != "" {
+			issues = append(issues, fmt.Sprintf("%s：%s（页面里写作 %s；出现在 %s）",
+				reason, url, written, strings.Join(pages, "、")))
+			continue
+		}
+		issues = append(issues, fmt.Sprintf("%s：%s（出现在 %s）",
+			reason, url, strings.Join(pages, "、")))
 	}
 	return issues
 }
@@ -134,7 +192,7 @@ func (s *Site) urlIsPublished(urlPath string) bool {
 		if s.ignoredForOutput(route.File, false) {
 			return false
 		}
-		rel, skip, err := assetRelPath(s, route.File)
+		rel, skip, err := s.artifactRel(route.File)
 		if err != nil || skip {
 			// 页面根里的 html 不会作为静态文件发布。
 			return false

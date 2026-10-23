@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"net/url"
 	"path"
 	"strings"
 
@@ -112,6 +113,11 @@ func (c *renderContext) fingerprintURL(pageDir, raw string) (string, bool, error
 	if !strings.HasPrefix(value, "/") && pageDir != "" && pageDir != "." {
 		relative = path.Join(pageDir, relative)
 	}
+	// 浏览器先对 URL 路径做百分号解码再找文件；解析与哈希都用解码后的路径，
+	// 输出的 URL 仍保留作者原来的编码形式。
+	if decoded, err := url.PathUnescape(relative); err == nil {
+		relative = decoded
+	}
 
 	// 文件存在但被忽略规则排除：产物里不会有它，直接报错。
 	if full, ok := c.site.resolveURL(relative); ok && c.site.ignoredForOutput(full, false) {
@@ -127,8 +133,9 @@ func (c *renderContext) fingerprintURL(pageDir, raw string) (string, bool, error
 
 // fingerprintSrcset 处理 srcset 里的多个候选：逗号分隔，每个候选是「URL [描述符]」。
 func (c *renderContext) fingerprintSrcset(pageDir, raw string) (string, bool, error) {
-	// data: URL 自身含逗号，拆分不可靠，整条跳过。
-	if strings.HasPrefix(strings.TrimSpace(raw), "data:") {
+	// data: URL 自身含逗号，按逗号拆分不可靠（data: 不在首位时会把后面的候选切碎），
+	// 保守起见整条跳过：不补版本号只是缓存失效，切错则会改写坏 URL。
+	if strings.Contains(raw, "data:") {
 		return "", false, nil
 	}
 

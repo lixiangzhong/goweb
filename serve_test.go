@@ -358,7 +358,8 @@ func TestWatchBroadcastsOnlyOnSuccessfulReload(t *testing.T) {
 	}
 
 	reloaded := make(chan struct{}, 8)
-	stop, err := watchSite(site, slog.New(slog.DiscardHandler), func() { reloaded <- struct{}{} })
+	logs := new(syncBuffer)
+	stop, err := watchSite(site, slog.New(slog.NewTextHandler(logs, nil)), func() { reloaded <- struct{}{} })
 	if err != nil {
 		t.Fatalf("watchSite: %v", err)
 	}
@@ -371,8 +372,10 @@ func TestWatchBroadcastsOnlyOnSuccessfulReload(t *testing.T) {
 	}
 
 	// 坏模板：重载失败，不应通知浏览器刷新（刷新只会看到同一份旧内容）。
+	// 等日志里出现「站点重载失败」再做否定断言，避免固定 sleep 在慢机器上抖动。
 	writeFile(t, filepath.Join(dir, "index.html"), "<html>{{template ")
-	time.Sleep(600 * time.Millisecond)
+	waitFor(t, 5*time.Second, func() bool { return strings.Contains(logs.String(), "站点重载失败") },
+		"坏模板应触发一次失败的重载")
 	if len(reloaded) != 0 {
 		t.Fatalf("重载失败不应通知浏览器，实际收到 %d 次", len(reloaded))
 	}

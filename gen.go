@@ -70,6 +70,14 @@ func Generate(site *Site, opts GenOptions) (GenResult, error) {
 			return result, stop
 		}
 	}
+	// 产物目录落在源码根内部时要被清空：默认 dist 是约定俗成的位置，不打扰；
+	// 其它位置（例如误写 --out static）很可能落在源码上，清空前给一条明确的警告。
+	if !opts.Check && opts.Clean && out != filepath.Join(site.Root(), defaultOutDir) {
+		if withinDir(site.PagesRoot(), out) || withinDir(site.AssetsRoot(), out) {
+			run.logger.Warn("产物目录位于页面根/资源根内，清空会删除其中原有的非产物文件",
+				"out", out)
+		}
+	}
 	if !opts.Check {
 		if opts.Clean {
 			if err := cleanDir(out); err != nil {
@@ -182,24 +190,51 @@ func (r *generateRun) renderPage(name string) ([]byte, error) {
 	return body, nil
 }
 
-// writePageFile 把一个页面写进产物目录。
+// writePageFile 把一个页面原子地写进产物目录：
+// 先写同目录临时文件再 rename，避免写入失败或进程中断留下半个页面。
 func writePageFile(out, rel string, body []byte) error {
 	target := filepath.Join(out, rel)
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return fmt.Errorf("创建页面目录 %q: %w", filepath.Dir(target), err)
+	dir := filepath.Dir(target)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("创建页面目录 %q: %w", dir, err)
 	}
-	if err := os.WriteFile(target, body, 0o644); err != nil {
+	tmp, err := os.CreateTemp(dir, ".goweb-page-*")
+	if err != nil {
+		return fmt.Errorf("创建临时页面 %q: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	success := false
+	defer func() {
+		if success {
+			return
+		}
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}()
+
+	if _, err := tmp.Write(body); err != nil {
 		return fmt.Errorf("写入页面 %q: %w", target, err)
 	}
+	if err := tmp.Chmod(0o644); err != nil {
+		return fmt.Errorf("设置页面权限 %q: %w", target, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("关闭页面 %q: %w", target, err)
+	}
+	if err := os.Rename(tmpName, target); err != nil {
+		return fmt.Errorf("落盘页面 %q: %w", target, err)
+	}
+	success = true
 	return nil
 }
 
 // recordArtifact 登记一个产物路径，撞车时直接报错（列出两个来源）。
+// 错误保持单行：check 会按行列出全部问题，多行错误会被拆成多条。
 func recordArtifact(artifacts map[string]string, rel, source string) error {
 	normalized := filepath.ToSlash(filepath.Clean(rel))
 	if previous, ok := artifacts[normalized]; ok {
-		return fmt.Errorf("产物路径冲突：%s\n  来源一：%s\n  来源二：%s\n"+
-			"请调整页面根/资源根，或用 .goweb.yml 的 ignore 排除其中一个", normalized, previous, source)
+		return fmt.Errorf("产物路径冲突：%s（来源一：%s；来源二：%s），请调整页面根/资源根，或用 ignore 排除其中一个",
+			normalized, previous, source)
 	}
 	artifacts[normalized] = source
 	return nil
@@ -213,13 +248,22 @@ func (o GenOptions) logger() *slog.Logger {
 	return slog.New(slog.DiscardHandler)
 }
 
-// guardOutDir 拦截会破坏源码的产物目录：项目根、三个根本身或它们的父目录，
-// 以及用户主目录。
+// guardOutDir 拦截会破坏源码的产物目录：项目根、三个根本身或它们的父目录、
+// 模板根内部、符号链接，以及用户主目录。
+//
+// 比较前先解析路径里的符号链接：`dist -> ../somewhere` 这类写法很常见，
+// 不解析的话「清空 dist」实际会删掉链接目标里的内容。
 func guardOutDir(site *Site, out string) error {
+	if info, err := os.Lstat(out); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("产物目录不能是符号链接：%s（请直接指定真实目录）", out)
+	}
+
+	outReal := canonicalPath(out)
+	rootReal := canonicalPath(site.Root())
 	switch {
-	case out == site.Root():
+	case outReal == rootReal:
 		return fmt.Errorf("产物目录不能是项目根：%s", out)
-	case isAncestor(out, site.Root()):
+	case isAncestor(outReal, rootReal):
 		return fmt.Errorf("产物目录不能是项目根的父目录：%s", out)
 	}
 	for _, root := range []struct {
@@ -233,17 +277,34 @@ func guardOutDir(site *Site, out string) error {
 		if root.path == "" {
 			continue
 		}
-		if out == root.path {
+		rootReal := canonicalPath(root.path)
+		if outReal == rootReal {
 			return fmt.Errorf("产物目录不能是%s：%s", root.name, out)
 		}
-		if isAncestor(out, root.path) {
+		if isAncestor(outReal, rootReal) {
 			return fmt.Errorf("产物目录不能是%s的父目录：%s", root.name, out)
 		}
+		if root.name == "模板根" && withinDir(rootReal, outReal) {
+			return fmt.Errorf("产物目录不能位于模板根内（模板根只读、不产出）：%s", out)
+		}
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" && out == filepath.Clean(home) {
+	if home, err := os.UserHomeDir(); err == nil && home != "" && outReal == canonicalPath(home) {
 		return fmt.Errorf("拒绝把用户主目录当作产物目录：%s", out)
 	}
 	return nil
+}
+
+// canonicalPath 解析路径中的符号链接；路径本身不存在时解析父目录再拼回文件名，
+// 保证「刚创建前的产物目录」与已存在的项目根可以按同一口径比较。
+func canonicalPath(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	parent := filepath.Dir(path)
+	if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+		return filepath.Join(resolved, filepath.Base(path))
+	}
+	return filepath.Clean(path)
 }
 
 // isAncestor 判断 dir 是否为 target 的祖先目录。
@@ -256,12 +317,23 @@ func isAncestor(dir, target string) bool {
 }
 
 // cleanDir 清空目录内容但保留目录本身；目录不存在时直接返回。
+// 符号链接一律拒绝：清空的应当是产物目录本身，而不是链接目标。
 func cleanDir(dir string) error {
-	entries, err := os.ReadDir(dir)
+	info, err := os.Lstat(dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
+		return fmt.Errorf("读取产物目录 %q: %w", dir, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("产物目录是符号链接，拒绝清空：%s", dir)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("产物目录不是目录：%s", dir)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
 		return fmt.Errorf("读取产物目录 %q: %w", dir, err)
 	}
 	for _, entry := range entries {
@@ -272,48 +344,40 @@ func cleanDir(dir string) error {
 	return nil
 }
 
-// copyAssets 把资源根下、页面与模板之外的文件拷进产物。
+// copyAssets 把页面根与资源根下、页面与模板之外的文件拷进产物。
 //
-// 产物路径按「所属根」决定：位于页面根内的文件按页面根相对路径
-// （这样页面里的相对引用才对得上），其余按资源根相对路径。
+// 遍历页面根 ∪ 资源根（去掉被包含的根，默认布局下整棵树只走一遍），产物路径按
+// 「所属根」决定：位于页面根内的文件按页面根相对路径（这样页面里的相对引用才对得上），
+// 其余按资源根相对路径。没有页面的纯资源根（例如 --assets 指向别处）也会被发布。
 // 被忽略规则排除的文件不进产物，并记录日志。
 // 生成模式下按扩展名可压缩的文件（CSS/JS/JSON/SVG/XML）会压缩后写出；校验模式只检查不写。
 func (r *generateRun) copyAssets() {
-	assetsRoot := r.site.AssetsRoot()
-	outInAssets := withinDir(assetsRoot, r.out) || r.out == assetsRoot
-
-	err := filepath.WalkDir(assetsRoot, func(filePath string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if filePath == assetsRoot {
-			return nil
-		}
-		if skip, skipDir := r.skipAssetEntry(filePath, entry, outInAssets); skip {
-			if skipDir {
-				return fs.SkipDir
+	for _, root := range r.site.sourceRoots() {
+		err := r.site.walkRoot(root, func(filePath string, entry fs.DirEntry) error {
+			if skip, skipDir := r.skipAssetEntry(filePath, entry); skip {
+				if skipDir {
+					return fs.SkipDir
+				}
+				return nil
 			}
-			return nil
+			if entry.IsDir() {
+				return nil
+			}
+			return r.copyAsset(filePath, entry)
+		})
+		if err != nil {
+			// 遍历本身出错（权限、I/O）：生成模式立即失败，校验模式记下继续。
+			_ = r.record(err)
 		}
-		if entry.IsDir() {
-			return nil
-		}
-		return r.copyAsset(filePath, entry)
-	})
-	if err != nil {
-		// 遍历本身出错（权限、I/O）：生成模式立即失败，校验模式记下继续。
-		_ = r.record(err)
 	}
 }
 
-// skipAssetEntry 判断资源遍历是否跳过该条目：扫描忽略项（隐藏项、node_modules、排除目录）、
-// 产物目录本身、模板根。skipDir 表示连整个目录一起跳过。
-func (r *generateRun) skipAssetEntry(filePath string, entry fs.DirEntry, outInAssets bool) (skip, skipDir bool) {
-	if r.site.skipInWalk(filePath) {
-		return true, entry.IsDir()
-	}
-	// 产物目录本身不参与拷贝（它在资源根里时）。
-	if outInAssets && withinDir(r.out, filePath) {
+// skipAssetEntry 判断资源遍历是否跳过该条目：产物目录本身与模板根。
+// 隐藏项、node_modules 与排除目录已由 Site.walkRoot 统一处理。
+// skipDir 表示连整个目录一起跳过。
+func (r *generateRun) skipAssetEntry(filePath string, entry fs.DirEntry) (skip, skipDir bool) {
+	// 产物目录本身不参与拷贝（它落在源码根里时，避免把上一轮产物当资源再拷一遍）。
+	if withinDir(r.out, filePath) {
 		return true, entry.IsDir()
 	}
 	// 模板根的内容不进产物。
@@ -326,7 +390,7 @@ func (r *generateRun) skipAssetEntry(filePath string, entry fs.DirEntry, outInAs
 // copyAsset 处理单个文件：算出产物路径 → 过滤（页面产物/忽略项/软链接）→ 计数，
 // 生成模式再拷贝或压缩写出。
 func (r *generateRun) copyAsset(filePath string, entry fs.DirEntry) error {
-	rel, skipPageHTML, err := assetRelPath(r.site, filePath)
+	rel, skipPageHTML, err := r.site.artifactRel(filePath)
 	if err != nil {
 		if stop := r.record(err); stop != nil {
 			return stop
@@ -340,18 +404,8 @@ func (r *generateRun) copyAsset(filePath string, entry fs.DirEntry) error {
 		r.logger.Info("跳过被忽略的文件", "file", filepath.ToSlash(rel))
 		return nil
 	}
-	if entry.Type()&fs.ModeSymlink != 0 {
-		isDir, err := symlinkToDir(filePath)
-		if err != nil {
-			if stop := r.record(err); stop != nil {
-				return stop
-			}
-			return nil
-		}
-		if isDir {
-			r.logger.Warn("跳过指向目录的符号链接", "path", filepath.ToSlash(rel))
-			return nil
-		}
+	if entry.Type()&fs.ModeSymlink != 0 && !r.allowSymlinkFile(filePath, rel) {
+		return nil
 	}
 	if err := recordArtifact(r.artifacts, rel, filePath); err != nil {
 		if stop := r.record(err); stop != nil {
@@ -371,41 +425,34 @@ func (r *generateRun) copyAsset(filePath string, entry fs.DirEntry) error {
 	return nil
 }
 
-// assetRelPath 给出资源文件在产物里的相对路径：
-// 页面根内的文件按页面根映射（保证与页面 URL 一致），其余按资源根映射。
-// 页面根里的 html 由模板渲染产出，此时 skip 为真。
-func assetRelPath(site *Site, filePath string) (rel string, skip bool, err error) {
-	rel, err = filepath.Rel(site.AssetsRoot(), filePath)
+// allowSymlinkFile 决定符号链接文件能否进产物：只有指向三个根之内的普通文件才允许，
+// 与 serve 的规则一致；指向目录、站点根之外或已失效的链接一律跳过并警告——
+// 一个无关的坏链接不该让整次生成失败。
+func (r *generateRun) allowSymlinkFile(filePath, rel string) bool {
+	target, err := filepath.EvalSymlinks(filePath)
 	if err != nil {
-		return "", false, fmt.Errorf("计算相对路径 %s: %w", filePath, err)
+		r.logger.Warn("跳过失效的符号链接", "path", filepath.ToSlash(rel))
+		return false
 	}
-	if !withinDir(site.PagesRoot(), filePath) {
-		return rel, false, nil
-	}
-	if strings.EqualFold(filepath.Ext(filePath), pageExt) {
-		return "", true, nil
-	}
-	if pageRel, pageErr := filepath.Rel(site.PagesRoot(), filePath); pageErr == nil {
-		rel = pageRel
-	}
-	return rel, false, nil
-}
-
-// symlinkToDir 判断符号链接是否指向目录。
-func symlinkToDir(filePath string) (bool, error) {
-	resolved, err := filepath.EvalSymlinks(filePath)
+	info, err := os.Stat(target)
 	if err != nil {
-		return false, fmt.Errorf("解析符号链接 %s: %w", filePath, err)
+		r.logger.Warn("跳过无法读取的符号链接", "path", filepath.ToSlash(rel), "err", err)
+		return false
 	}
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return false, fmt.Errorf("读取符号链接目标 %s: %w", resolved, err)
+	switch {
+	case info.IsDir():
+		r.logger.Warn("跳过指向目录的符号链接", "path", filepath.ToSlash(rel))
+		return false
+	case !r.site.withinAnyRootResolved(target):
+		r.logger.Warn("跳过指向站点根之外的符号链接", "path", filepath.ToSlash(rel), "target", target)
+		return false
 	}
-	return info.IsDir(), nil
+	return true
 }
 
 // copyFile 拷贝单个文件到目标路径。
 // minifier 非空且 mediaType 非空时改为「流式压缩写入」，其余情况逐字节原样拷贝。
+// 任何一步失败都会删掉目标文件，避免半个文件留在产物里被当成正常产物。
 func copyFile(src, dst string, minifier *minify.M, mediaType string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -420,21 +467,26 @@ func copyFile(src, dst string, minifier *minify.M, mediaType string) error {
 	if err != nil {
 		return fmt.Errorf("创建 %s: %w", dst, err)
 	}
+	success := false
+	defer func() {
+		if success {
+			return
+		}
+		_ = out.Close()
+		_ = os.Remove(dst)
+	}()
 
 	if minifier != nil && mediaType != "" {
 		if err := minifier.Minify(mediaType, out, in); err != nil {
-			out.Close()
-			// 压缩是流式写入，失败会留下半个文件；删掉它，别把坏文件留在产物里。
-			_ = os.Remove(dst)
 			return fmt.Errorf("压缩 %s: %w", src, err)
 		}
 	} else if _, err := io.Copy(out, in); err != nil {
-		out.Close()
 		return fmt.Errorf("写入 %s: %w", dst, err)
 	}
 
 	if err := out.Close(); err != nil {
 		return fmt.Errorf("关闭 %s: %w", dst, err)
 	}
+	success = true
 	return nil
 }

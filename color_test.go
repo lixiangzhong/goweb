@@ -100,6 +100,9 @@ func TestWantColorLogsRespectsNoColor(t *testing.T) {
 	if wantColorLogs(&bytes.Buffer{}) {
 		t.Fatal("非终端输出不应上色")
 	}
+	if info, err := os.Stderr.Stat(); err != nil || info.Mode()&os.ModeCharDevice == 0 {
+		t.Skip("stderr 不是终端，NO_COLOR 分支不可达（CI 上必然空转）")
+	}
 	t.Setenv("NO_COLOR", "1")
 	if wantColorLogs(os.Stderr) {
 		t.Fatal("设置了 NO_COLOR 时不应上色")

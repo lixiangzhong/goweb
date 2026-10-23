@@ -148,16 +148,31 @@ func TestResolve(t *testing.T) {
 	}
 }
 
-// TestResolveNeverEscapesRoot 确保带 .. 的路径不会落到页面目录之外的磁盘文件。
+// TestResolveNeverEscapesRoot 确保带 .. 的路径与指向站点根之外的符号链接都不会落到
+// 页面目录之外的磁盘文件（原断言只在 RouteFile 时检查，而这些路径实际都是 NotFound，
+// 等于永远通过）。
 func TestResolveNeverEscapesRoot(t *testing.T) {
 	site := loadTestSite(t, testSiteFiles())
-	root := site.Root()
-
 	for _, path := range []string{"/../etc/passwd", "/static/../../etc/passwd", "/%2e%2e/etc/passwd"} {
-		route := site.Resolve(path)
-		if route.Kind == RouteFile && !strings.HasPrefix(route.File, root+string(filepath.Separator)) {
-			t.Fatalf("Resolve(%q) 逃出页面目录: %s", path, route.File)
+		if route := site.Resolve(path); route.Kind != RouteNotFound {
+			t.Fatalf("Resolve(%q).Kind = %v，期望 NotFound", path, route.Kind)
 		}
+	}
+
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("secret"), 0o644); err != nil {
+		t.Fatalf("写入站外文件: %v", err)
+	}
+	dir := writeSite(t, map[string]string{"index.html": "<html>INDEX</html>"})
+	if err := os.Symlink(outside, filepath.Join(dir, "leak.txt")); err != nil {
+		t.Skipf("当前环境不支持符号链接: %v", err)
+	}
+	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates"})
+	if err != nil {
+		t.Fatalf("LoadSite: %v", err)
+	}
+	if route := site.Resolve("/leak.txt"); route.Kind != RouteNotFound {
+		t.Fatalf("指向站外的符号链接不应被提供: %+v", route)
 	}
 }
 

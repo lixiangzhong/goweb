@@ -83,12 +83,11 @@ func runInit(cmd *cobra.Command, globals *globalOptions, opts initOptions) error
 	}
 
 	target := strings.TrimSpace(globals.config)
-	switch {
-	case target != "":
+	if target != "" {
 		if !filepath.IsAbs(target) {
 			target = filepath.Join(workingDir, target)
 		}
-	case true:
+	} else {
 		existing, err := findConfigFile(workingDir)
 		if err != nil {
 			return err
@@ -103,6 +102,12 @@ func runInit(cmd *cobra.Command, globals *globalOptions, opts initOptions) error
 
 	if _, err := os.Stat(target); err == nil && !opts.force {
 		return fmt.Errorf("配置文件已存在：%s\n要覆盖请加 --force，或换个路径：goweb init --config <路径>", target)
+	}
+	// --config 可能指向还不存在的多级目录（例如 ci/.goweb.yml），先把父目录建出来。
+	if dir := filepath.Dir(target); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("创建配置文件目录 %s: %w", dir, err)
+		}
 	}
 	if err := os.WriteFile(target, []byte(defaultConfigTemplate), 0o644); err != nil {
 		return fmt.Errorf("写入配置文件 %s: %w", target, err)

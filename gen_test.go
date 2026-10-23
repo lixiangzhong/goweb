@@ -166,8 +166,12 @@ func TestGenerateFailsFastOnBrokenPage(t *testing.T) {
 		t.Fatalf("错误信息应指出出错页面: %v", err)
 	}
 
-	if _, err := os.Stat(filepath.Join(out, "bad", "index.html")); err == nil {
+	// 产物是扁平布局：bad.html -> out/bad.html。渲染失败应立即中止，不写半成品。
+	if _, err := os.Stat(filepath.Join(out, "bad.html")); err == nil {
 		t.Fatal("渲染失败的页面不应留下产物")
+	}
+	if _, err := os.Stat(filepath.Join(out, "index.html")); err == nil {
+		t.Fatal("渲染失败后应立即中止，不应继续写后续页面")
 	}
 }
 
@@ -185,11 +189,11 @@ func TestGenerateAssets(t *testing.T) {
 	})
 
 	// 指向文件的符号链接按内容拷贝；指向目录的符号链接跳过（避免逃出站点或成环）。
-	if err := os.Symlink(filepath.Join(dir, "assets", "logo.svg"), filepath.Join(dir, "static", "logo-link.svg")); err != nil {
-		t.Skipf("当前环境不支持符号链接: %v", err)
-	}
-	if err := os.Symlink(filepath.Join(dir, "assets"), filepath.Join(dir, "static", "assets-link")); err != nil {
-		t.Skipf("当前环境不支持符号链接: %v", err)
+	// 不支持符号链接的平台（例如部分 Windows 环境）只跳过相关断言，其余边界照常覆盖。
+	fileLinkErr := os.Symlink(filepath.Join(dir, "assets", "logo.svg"), filepath.Join(dir, "static", "logo-link.svg"))
+	dirLinkErr := os.Symlink(filepath.Join(dir, "assets"), filepath.Join(dir, "static", "assets-link"))
+	if fileLinkErr != nil || dirLinkErr != nil {
+		t.Logf("当前环境不支持符号链接（file=%v dir=%v），跳过符号链接断言", fileLinkErr, dirLinkErr)
 	}
 
 	site, err := LoadSite(SiteOptions{Dir: dir, TemplateDir: "templates", ExcludeDirs: []string{"dist"}})
@@ -212,15 +216,19 @@ func TestGenerateAssets(t *testing.T) {
 		"index.html",
 		"static/css/site.css",
 		"static/deep/a/b.txt",
-		"static/logo-link.svg",
+	}
+	wantAssets := 3
+	if fileLinkErr == nil {
+		want = append(want, "static/logo-link.svg")
+		wantAssets++
 	}
 	if got := listFiles(t, filepath.Join(dir, "dist")); !equalStrings(got, want) {
 		t.Fatalf("产物清单 = %v，期望 %v", got, want)
 	}
-	if result.Assets != 4 {
-		t.Fatalf("资源数 = %d，期望 4", result.Assets)
+	if result.Assets != wantAssets {
+		t.Fatalf("资源数 = %d，期望 %d", result.Assets, wantAssets)
 	}
-	if !strings.Contains(logs.String(), "跳过指向目录的符号链接") {
+	if dirLinkErr == nil && !strings.Contains(logs.String(), "跳过指向目录的符号链接") {
 		t.Fatalf("日志中缺少跳过符号链接目录的记录: %s", logs.String())
 	}
 }
@@ -291,9 +299,10 @@ func TestGenCommandOutDirBoundary(t *testing.T) {
 		"static/a.css": "body{}",
 	})
 
-	// 连跑两次默认 gen：第二次 dist/ 里已有内容，仍然不能把自己拷进自己。
+	// 连跑两次且不清空产物：第二次 dist/ 里已有内容，仍然不能把自己拷进自己。
+	// （默认 clean=true 会先清空 dist，反而覆盖不到这条边界，所以显式关闭。）
 	for attempt := 1; attempt <= 2; attempt++ {
-		if _, stderr, err := executeCLIInSite(t, dir, "gen"); err != nil {
+		if _, stderr, err := executeCLIInSite(t, dir, "gen", "--clean=false"); err != nil {
 			t.Fatalf("第 %d 次 gen: %v（stderr: %s）", attempt, err, stderr)
 		}
 	}

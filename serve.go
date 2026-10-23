@@ -154,6 +154,10 @@ type siteWatcher struct {
 
 	mu    sync.Mutex
 	timer *time.Timer
+	// stopped 由 stop 置位：之后不再排新的重载。
+	stopped bool
+	// wg 跟踪正在执行的重载，stop 时等它们结束，避免关停后还在打日志。
+	wg sync.WaitGroup
 }
 
 // selfOutputFiles 返回本进程 stdout/stderr 指向的常规文件。
@@ -202,11 +206,27 @@ func watchSite(site *Site, logger *slog.Logger, onReload func()) (func(), error)
 		selfOutputs: selfOutputFiles(),
 	}
 	if err := sw.addPaths(); err != nil {
+		// 监听失败不该拖垮开发服务器：热重载只是附属功能，
+		// 路由、模板渲染与静态文件照常工作，降级为「改完手动刷新」。
 		watcher.Close()
-		return nil, err
+		logger.Warn("文件监听不可用，热重载已关闭", "err", err)
+		return func() {}, nil
 	}
 	go sw.loop()
-	return func() { watcher.Close() }, nil
+	return sw.stop, nil
+}
+
+// stop 关闭监听并等待在途重载结束：停止后防抖计时器不再触发，
+// 也不会再补挂监听，避免关停瞬间还打一条「补挂文件监听失败」的告警。
+func (w *siteWatcher) stop() {
+	w.mu.Lock()
+	w.stopped = true
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	w.mu.Unlock()
+	_ = w.watcher.Close()
+	w.wg.Wait()
 }
 
 // loop 消费文件系统事件，忽略产物与隐藏项，其余触发防抖重载。
@@ -234,11 +254,28 @@ func (w *siteWatcher) loop() {
 func (w *siteWatcher) schedule() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.stopped {
+		return
+	}
 	if w.timer == nil {
-		w.timer = time.AfterFunc(reloadDebounce, w.reload)
+		w.timer = time.AfterFunc(reloadDebounce, w.fire)
 		return
 	}
 	w.timer.Reset(reloadDebounce)
+}
+
+// fire 是防抖窗口到期后的回调：持锁确认未停止并登记一次在途重载，
+// 让 stop 能等到它结束（计入 WaitGroup 后再执行，避免与 wg.Wait 竞态）。
+func (w *siteWatcher) fire() {
+	w.mu.Lock()
+	if w.stopped {
+		w.mu.Unlock()
+		return
+	}
+	w.wg.Add(1)
+	w.mu.Unlock()
+	defer w.wg.Done()
+	w.reload()
 }
 
 // reload 重载模板与 data.json，并补挂新增目录的监听。

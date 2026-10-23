@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"regexp"
@@ -53,7 +54,7 @@ func newColorWriter(out io.Writer) *colorWriter {
 func (c *colorWriter) Write(p []byte) (int, error) {
 	c.pending = append(c.pending, p...)
 	for {
-		index := strings.IndexByte(string(c.pending), '\n')
+		index := bytes.IndexByte(c.pending, '\n')
 		if index < 0 {
 			break
 		}

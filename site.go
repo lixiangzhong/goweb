@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"html/template"
 	"io/fs"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -87,6 +88,9 @@ type Site struct {
 	pagesRoot    string
 	templateRoot string
 	assetsRoot   string
+	// realRoots 是三个根解析软链接后的实际路径，用于判断软链接目标是否越出站点。
+	// macOS 的临时目录、/var 等本身就是软链接，按字面路径比较容易误判。
+	realRoots []string
 	// excludes 是排除目录的绝对路径。
 	excludes []string
 	// mode 是渲染模式（dev / prod）。
@@ -152,6 +156,12 @@ func LoadSite(opts SiteOptions) (*Site, error) {
 	if site.assetsRoot, err = resolveRoot(projectRoot, opts.AssetsRoot, "."); err != nil {
 		return nil, fmt.Errorf("解析资源根: %w", err)
 	}
+	// 模板根是「只读、不产出、不可访问」的子树；它一旦覆盖页面根或资源根，
+	// 页面发现与资源发布会被整体清空（而且产物是空的却照样成功），必须在加载期拦住。
+	if err := validateTemplateRoot(site); err != nil {
+		return nil, err
+	}
+	site.realRoots = canonicalRoots(site.pagesRoot, site.templateRoot, site.assetsRoot)
 	// 忽略规则只在产出产物时生效（serve 仍可见被忽略的文件）。
 	if site.publishing {
 		matcher, err := loadIgnoreMatcher(projectRoot, opts.UseGitignore, opts.IgnorePatterns)
@@ -181,6 +191,26 @@ func resolveRoot(projectRoot, value, fallback string) (string, error) {
 		raw = filepath.Join(projectRoot, raw)
 	}
 	return filepath.Abs(raw)
+}
+
+// validateTemplateRoot 拒绝「模板根覆盖页面根或资源根」的配置。
+//
+// 模板根里的内容只参与模板解析：既不产出页面，也不进入产物、不可访问。
+// 一旦它是页面根或资源根的祖先（含相等），整棵子树都会被排除，站点会变成
+// 「产物为空但 gen/check 都成功」的静默故障，因此在加载期直接报错。
+func validateTemplateRoot(site *Site) error {
+	if site.templateRoot == "" {
+		return nil
+	}
+	if site.templateRoot == site.pagesRoot || isAncestor(site.templateRoot, site.pagesRoot) {
+		return fmt.Errorf("模板根不能是页面根或其祖先（会排除全部页面）：模板根 %s，页面根 %s",
+			site.templateRoot, site.pagesRoot)
+	}
+	if site.templateRoot == site.assetsRoot || isAncestor(site.templateRoot, site.assetsRoot) {
+		return fmt.Errorf("模板根不能是资源根或其祖先（会跳过全部资源）：模板根 %s，资源根 %s",
+			site.templateRoot, site.assetsRoot)
+	}
+	return nil
 }
 
 // Reload 重新扫描并编译模板；失败时保留原有模板集合，因此调用方可以自行决定
@@ -271,12 +301,22 @@ func (s *Site) BuildTime() time.Time {
 // 页面（渲染产物与源文件内容不一致，哈希源文件没有意义）、局部模板目录、
 // 产物目录与扫描忽略项一律拒绝，避免产出指向不存在资源的链接。
 func (s *Site) assetFile(urlPath string) (string, error) {
-	rel := strings.TrimPrefix(filepath.ToSlash(urlPath), "/")
+	rel := strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(urlPath)), "/")
 	if rel == "" {
 		return "", errors.New("asset 需要资源路径，例如 {{asset \"/static/css/site.css\"}}")
 	}
+	if decoded, err := url.PathUnescape(rel); err == nil {
+		rel = decoded
+	}
 	full, ok := s.resolveURL(rel)
 	if !ok {
+		// 文件存在但不发布在这个 URL 上时，给出产物路径提示，避免作者按源文件位置写链接。
+		if source, found := s.findSourceFile(rel); found {
+			if artifact, skip, artifactErr := s.artifactRel(source); artifactErr == nil && !skip {
+				return "", fmt.Errorf("资源 %s 的产物路径是 /%s，请按产物路径引用",
+					urlPath, filepath.ToSlash(artifact))
+			}
+		}
 		return "", fmt.Errorf("asset 只接受会进入产物的静态资源：%s", urlPath)
 	}
 	ext := filepath.Ext(rel)
@@ -297,9 +337,32 @@ func (s *Site) assetFile(urlPath string) (string, error) {
 	return full, nil
 }
 
-// resolveURL 把 URL 相对路径解析成磁盘文件：页面根优先，资源根兜底。
-// 模板根、排除目录、隐藏项与 node_modules 一律视为不存在（与产物内容保持一致）。
-func (s *Site) resolveURL(rel string) (string, bool) {
+// hasSymlinkDir 判断 filePath 相对 root 的路径里是否有中间目录是符号链接。
+func hasSymlinkDir(root, filePath string) bool {
+	rel, err := filepath.Rel(root, filePath)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	dir := root
+	for _, part := range parts[:len(parts)-1] {
+		dir = filepath.Join(dir, part)
+		info, err := os.Lstat(dir)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// findSourceFile 在页面根/资源根里查找 URL 相对路径对应的磁盘文件（页面根优先）。
+//
+// 模板根、排除目录、隐藏项与 node_modules 视为不存在；软链接指向三个根之外时同样
+// 视为不存在，避免 serve 与 gen 通过软链接把站点根之外的文件暴露出去。
+func (s *Site) findSourceFile(rel string) (string, bool) {
+	if rel == "" {
+		return "", false
+	}
 	for _, root := range []string{s.pagesRoot, s.assetsRoot} {
 		if root == "" {
 			continue
@@ -312,11 +375,89 @@ func (s *Site) resolveURL(rel string) (string, bool) {
 		if s.ignoredPath(full) || s.withinTemplateRoot(full) {
 			continue
 		}
-		if info, err := os.Stat(full); err == nil && info.Mode().IsRegular() {
-			return full, true
+		info, err := os.Stat(full)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
 		}
+		// gen 遍历不跟随目录软链接，serve 若跟随就会造出「本地能开、产物里没有」的 URL。
+		if hasSymlinkDir(root, full) {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(full)
+		if err != nil || !s.withinAnyRootResolved(resolved) {
+			continue
+		}
+		return full, true
 	}
 	return "", false
+}
+
+// resolveURL 把 URL 相对路径解析成「部署后仍然存在」的磁盘文件。
+//
+// 不变式：URL 必须与文件的产物路径相等。文件虽然存在于某个根里，但按产物映射会落到
+// 另一个 URL 时，它在该 URL 上就应当是 404（例如页面根外的资源按资源根映射）。
+// serve、自动指纹与链接校验共用这条规则，保证「本地能打开 == 线上存在」。
+func (s *Site) resolveURL(rel string) (string, bool) {
+	full, ok := s.findSourceFile(rel)
+	if !ok {
+		return "", false
+	}
+	artifact, skip, err := s.artifactRel(full)
+	if err != nil || skip {
+		return "", false
+	}
+	if filepath.ToSlash(artifact) != rel {
+		return "", false
+	}
+	return full, true
+}
+
+// artifactRel 给出文件在产物里的相对路径：页面根内的文件按页面根映射
+// （保证与页面 URL 一致），其余按资源根映射；页面根里的 html 由模板渲染产出，skip 为真。
+func (s *Site) artifactRel(filePath string) (rel string, skip bool, err error) {
+	rel, err = filepath.Rel(s.assetsRoot, filePath)
+	if err != nil {
+		return "", false, fmt.Errorf("计算相对路径 %s: %w", filePath, err)
+	}
+	if !withinDir(s.pagesRoot, filePath) {
+		return rel, false, nil
+	}
+	if strings.EqualFold(filepath.Ext(filePath), pageExt) {
+		return "", true, nil
+	}
+	if pageRel, pageErr := filepath.Rel(s.pagesRoot, filePath); pageErr == nil {
+		rel = pageRel
+	}
+	return rel, false, nil
+}
+
+// sourceRoots 返回需要遍历发布的根（页面根 ∪ 资源根），并去掉被另一个根包含的根，
+// 避免默认布局（两个根都是项目根）下整棵树走两遍。
+func (s *Site) sourceRoots() []string {
+	var roots []string
+	for _, root := range []string{s.pagesRoot, s.assetsRoot} {
+		if root == "" {
+			continue
+		}
+		covered := false
+		for _, kept := range roots {
+			if withinDir(kept, root) {
+				covered = true
+				break
+			}
+		}
+		if covered {
+			continue
+		}
+		kept := make([]string, 0, len(roots))
+		for _, old := range roots {
+			if !withinDir(root, old) {
+				kept = append(kept, old)
+			}
+		}
+		roots = append(kept, root)
+	}
+	return roots
 }
 
 // Pages 返回排序后的页面模板名，例如 index、about、help/74。
@@ -344,20 +485,23 @@ func (s *Site) DataFile() string {
 // 数据是普通 map，缺键按 Go 模板原生语义渲染成空字符串（例如页面写错
 // {{.site.titl}} 不会报错，只是留白），拼写错误需要自行核对。
 func (s *Site) Render(name string) ([]byte, error) {
+	// 只在取快照时持锁：模板执行（可能读大量文件）不阻塞热重载替换快照。
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	tmpl := s.tmpl.Lookup(name)
+	data := s.data
+	rewrite := s.rewrite
+	s.mu.RUnlock()
 	if tmpl == nil {
 		return nil, fmt.Errorf("模板 %q 不存在", name)
 	}
 	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, s.data); err != nil {
+	if err := tmpl.Execute(&buf, data); err != nil {
 		return nil, fmt.Errorf("渲染 %q: %w", name, err)
 	}
 	// 开启后给站内静态资源引用补 ?v=<内容哈希>；serve 与 gen 共用这条路径，
 	// 保证本地看到的 URL 与产物一致。
-	if s.rewrite != nil {
-		body, err := s.rewrite(name, buf.Bytes())
+	if rewrite != nil {
+		body, err := rewrite(name, buf.Bytes())
 		if err != nil {
 			return nil, err
 		}
@@ -387,7 +531,13 @@ func withinDir(dir, absPath string) bool {
 //
 // 这里刻意不区分文件与目录：名为 node_modules 的普通文件同样忽略。serve 与 gen 必须
 // 对同一个路径给出同一答案，否则会出现「gen 把它拷进产物、serve 却拒绝提供」的分叉。
+//
+// "." 与 ".." 是相对路径里的路径记号，不是隐藏文件名：三个根允许位于项目根之外，
+// 此时相对项目根的路径必然带 ".." 组件，不能被误判成隐藏项而整站忽略。
 func ignoredName(name string) bool {
+	if name == "." || name == ".." {
+		return false
+	}
 	return strings.HasPrefix(name, ".") || name == nodeModulesDir
 }
 
@@ -409,7 +559,7 @@ func (s *Site) ignoredPath(filePath string) bool {
 	return s.isExcluded(filePath)
 }
 
-// withinAnyRoot 判断路径是否落在三个根之内。
+// withinAnyRoot 判断路径是否落在三个根之内（按字面路径比较）。
 func (s *Site) withinAnyRoot(filePath string) bool {
 	for _, root := range []string{s.pagesRoot, s.templateRoot, s.assetsRoot} {
 		if withinDir(root, filePath) {
@@ -417,6 +567,94 @@ func (s *Site) withinAnyRoot(filePath string) bool {
 		}
 	}
 	return false
+}
+
+// withinAnyRootResolved 判断「解析软链接后的真实路径」是否落在三个根的真实路径之内。
+// 用于校验软链接目标：站点根自身可能位于软链接下（macOS 的 /var、临时目录），
+// 按字面路径比较会把合法目标误判成越界。
+func (s *Site) withinAnyRootResolved(realPath string) bool {
+	for _, root := range s.realRoots {
+		if withinDir(root, realPath) {
+			return true
+		}
+	}
+	return false
+}
+
+// canonicalRoots 返回去空、去重后的真实根路径。
+func canonicalRoots(roots ...string) []string {
+	seen := make(map[string]bool, len(roots))
+	canonical := make([]string, 0, len(roots))
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		if real, err := filepath.EvalSymlinks(root); err == nil {
+			root = real
+		}
+		root = filepath.Clean(root)
+		if seen[root] {
+			continue
+		}
+		seen[root] = true
+		canonical = append(canonical, root)
+	}
+	return canonical
+}
+
+// allRoots 返回站点内容涉及的全部根：页面根、资源根，以及不在前两者之内的模板根。
+// 用来遍历「站点内容」时避免同一棵子树被重复走（默认布局下页面根与资源根都是项目根）。
+func (s *Site) allRoots() []string {
+	roots := s.sourceRoots()
+	if s.templateRoot != "" {
+		covered := false
+		for _, root := range roots {
+			if withinDir(root, s.templateRoot) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			roots = append(roots, s.templateRoot)
+		}
+	}
+	return roots
+}
+
+// walkRoot 以统一的扫描规则遍历 root：跳过隐藏项、node_modules 与排除目录（整棵子树）。
+// 遍历错误（含根不存在）交给调用方处理；只想尽力而为请用 walkRootLenient。
+func (s *Site) walkRoot(root string, fn func(filePath string, entry fs.DirEntry) error) error {
+	return s.walkRootMode(root, false, fn)
+}
+
+// walkRootLenient 与 walkRoot 相同，但忽略遍历错误：监听集合、构建时间这类场景
+// 失败也不该拖垮启动或渲染。
+func (s *Site) walkRootLenient(root string, fn func(filePath string, entry fs.DirEntry) error) error {
+	return s.walkRootMode(root, true, fn)
+}
+
+func (s *Site) walkRootMode(root string, lenient bool, fn func(filePath string, entry fs.DirEntry) error) error {
+	if root == "" {
+		return nil
+	}
+	return filepath.WalkDir(root, func(filePath string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if lenient {
+				return nil //nolint:nilerr // 根不存在或权限不足都属于尽力而为的场景
+			}
+			return walkErr
+		}
+		if filePath == root {
+			return nil
+		}
+		if s.skipInWalk(filePath) {
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		return fn(filePath, entry)
+	})
 }
 
 // WatchPaths 返回需要监听的文件系统路径（目录与文件）。
@@ -427,21 +665,12 @@ func (s *Site) WatchPaths() ([]string, error) {
 	seen := make(map[string]bool)
 	var paths []string
 
-	for _, root := range []string{s.pagesRoot, s.templateRoot, s.assetsRoot} {
-		if root == "" {
-			continue
+	for _, root := range s.allRoots() {
+		if info, statErr := os.Stat(root); statErr == nil && info.IsDir() && !seen[root] {
+			seen[root] = true
+			paths = append(paths, root)
 		}
-		err := filepath.WalkDir(root, func(filePath string, entry fs.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				// 根可能不存在（例如站点还没建 templates/），忽略即可。
-				return nil //nolint:nilerr
-			}
-			if filePath != root && s.skipInWalk(filePath) {
-				if entry.IsDir() {
-					return fs.SkipDir
-				}
-				return nil
-			}
+		err := s.walkRootLenient(root, func(filePath string, _ fs.DirEntry) error {
 			if !seen[filePath] {
 				seen[filePath] = true
 				paths = append(paths, filePath)
@@ -511,19 +740,7 @@ func (s *Site) pageFiles() ([]string, error) {
 	separateTemplateRoot := s.hasSeparateTemplateRoot()
 	var files []string
 
-	err := filepath.WalkDir(s.pagesRoot, func(filePath string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if filePath == s.pagesRoot {
-			return nil
-		}
-		if s.skipInWalk(filePath) {
-			if entry.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
+	err := s.walkRoot(s.pagesRoot, func(filePath string, entry fs.DirEntry) error {
 		if separateTemplateRoot && s.withinTemplateRoot(filePath) {
 			if entry.IsDir() {
 				return fs.SkipDir
@@ -548,19 +765,7 @@ func (s *Site) partialFiles() ([]string, error) {
 	}
 
 	var files []string
-	err := filepath.WalkDir(s.templateRoot, func(filePath string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if filePath == s.templateRoot {
-			return nil
-		}
-		if s.skipInWalk(filePath) {
-			if entry.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
+	err := s.walkRoot(s.templateRoot, func(filePath string, entry fs.DirEntry) error {
 		if !entry.IsDir() && isPageFile(filePath) {
 			files = append(files, filePath)
 		}
@@ -644,23 +849,11 @@ func (s *Site) resolveBuildTime() time.Time {
 	return newest.Truncate(time.Second)
 }
 
-// newestModTime 返回三个根下（忽略项之外）最新的文件修改时间。
+// newestModTime 返回站点内容（忽略项之外）最新的文件修改时间。
 func (s *Site) newestModTime() time.Time {
 	var newest time.Time
-	for _, root := range []string{s.pagesRoot, s.templateRoot, s.assetsRoot} {
-		if root == "" {
-			continue
-		}
-		_ = filepath.WalkDir(root, func(filePath string, entry fs.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return nil //nolint:nilerr // 根不存在属于正常情况
-			}
-			if filePath != root && s.skipInWalk(filePath) {
-				if entry.IsDir() {
-					return fs.SkipDir
-				}
-				return nil
-			}
+	for _, root := range s.allRoots() {
+		_ = s.walkRootLenient(root, func(_ string, entry fs.DirEntry) error {
 			if entry.IsDir() {
 				return nil
 			}
@@ -804,15 +997,17 @@ func (s *Site) match(candidate routeCandidate) (Route, bool) {
 	if !ok {
 		return Route{}, false
 	}
-	if candidate.page == "" {
-		return Route{Kind: RouteFile, File: file}, true
+	if candidate.page != "" && s.hasPage(candidate.page) {
+		return Route{Kind: RoutePage, Name: candidate.page}, true
 	}
-	if !s.hasPage(candidate.page) {
-		// 页面目录内可被提供的 html 都是页面；出现没注册成页面的 html 时按不存在处理，
-		// 避免把未渲染的模板源码直接吐给浏览器。
+	if candidate.page != "" && withinDir(s.pagesRoot, file) {
+		// 页面根里的 html 都是页面；没有被登记成页面的（例如被忽略的模板源码）
+		// 按不存在处理，避免把未渲染的模板直接吐给浏览器。
 		return Route{}, false
 	}
-	return Route{Kind: RoutePage, Name: candidate.page}, true
+	// 页面根之外的 html（例如资源根里的 .html 文件）会原样进产物，
+	// 与 nginx 一致按静态文件直出。
+	return Route{Kind: RouteFile, File: file}, true
 }
 
 // pageNameOf 返回文件相对路径对应的页面模板名；非 html 文件返回空。
@@ -831,7 +1026,27 @@ func (s *Site) servableFile(rel string) (string, bool) {
 	if rel == "" {
 		return "", false
 	}
-	return s.resolveURL(rel)
+	full, ok := s.findSourceFile(rel)
+	if !ok {
+		return "", false
+	}
+	artifact, skip, err := s.artifactRel(full)
+	if err != nil {
+		return "", false
+	}
+	if skip {
+		// 页面根里的 html 是页面源文件：它不会被逐字节发布，但会渲染成一个同路径的
+		// 产物页面（about.html -> about 页 -> 产物 about.html）。这里只确认「确实有页面」，
+		// URL 最终是否以页面身份出货由 match() 决定。
+		return full, s.hasPage(pageNameOf(rel))
+	}
+	// 不变式：URL 必须与文件在产物里的路径相等。文件虽然存在于某个根里，
+	// 但按产物映射会落到另一个 URL 时，它在这个 URL 上应当是 404
+	// （例如页面根外的 html 按资源根映射；多写一层页面根路径的 URL 也是 404）。
+	if filepath.ToSlash(artifact) != rel {
+		return "", false
+	}
+	return full, true
 }
 
 // normalizePath 按 nginx 的方式归一化 URL 路径：折叠重复斜杠、解析 . 与 .. 段，
