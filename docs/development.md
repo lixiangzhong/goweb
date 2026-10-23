@@ -55,6 +55,7 @@ go test -short -cover ./...   # 覆盖率
 | `check_test.go` | `Generate`（Check）/ `urlIsPublished` | 不落盘且不动已有产物、问题汇总（渲染失败+路径冲突+坏链接一次列全）、`--links=false`、链接指向被忽略目标、URL 与产物路径一致性的判定 |
 | `init_test.go` | `runInit` / `defaultConfigTemplate` | 生成内容与模板一致、键集合与 `fileConfig` 对齐、`addr` 只作注释、不改变默认行为、已存在报错且不改文件、`--force`、向上查找不生成嵌套配置、`--config` 指定路径、init 后能直接 build |
 | `main_test.go` | cobra 命令树 | 参数默认值与短选项、公共参数前置、错误前缀与 usage、`--version` 注入、`dev`/`build` 别名等价 |
+| `regression_test.go` | `LoadSite` / `Resolve` / `Generate` / `check` / `Render` | 审计回归锁：模板根覆盖校验、URL 与产物路径一致（多写页面根 404、页面根外 html 直出、百分号编码）、index 相对链接双基准、页面根资源拷贝、产物目录符号链接拒绝、软链接策略、冲突单条化、gen 日志 fingerprint 字段、默认只监听 127.0.0.1 |
 | `e2e_test.go` | **真实二进制 + 真实 HTTP** | 编译 goweb → 跑 `gen`（产物清单、幂等、护栏退出码、坏数据失败、产物不含热重载脚本、`pages/ + templates/ + static/` 三根布局与 `.goweb.yml` 驱动）与 `serve`（全部 URL 语义、405/404、缓存头、SSE 推送刷新事件、`--livereload=false`、坏模板韧性、被忽略文件本地仍可见、`--version`/`help`/`completion`） |
 | `e2e_test.go`（自动开浏览器） | 真实 `serve` + `GOWEB_OPEN_COMMAND` | 现场编译一个「把收到的参数写进文件」的记录器程序当打开命令（跨平台，不弹窗），验证 serve 确实把**真实监听地址**交给它，且 `--open=false` 完全不调用 |
 
