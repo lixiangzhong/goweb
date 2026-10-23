@@ -56,12 +56,30 @@ snapshot:
 
 changelog:
   sort: asc
+  # 发版说明自动生成策略：按提交类型分组，只过滤纯工程噪声（ci/chore/test），
+  # 用户可感知的 fix/feat/perf/refactor/docs 全部保留，避免像 v0.3.0 那样只列出一条。
+  # 需要多段式说明（概览、升级提示等）时，发布后手动补写，见 docs/development.md。
   filters:
     exclude:
-      - "^docs:"
-      - "^test:"
-      - "^chore:"
       - "^ci:"
+      - "^chore:"
+      - "^test:"
+  groups:
+    - title: "新功能"
+      regexp: '^feat(\(.+\))?!?:'
+      order: 10
+    - title: "修复"
+      regexp: '^fix(\(.+\))?!?:'
+      order: 20
+    - title: "性能与重构"
+      regexp: '^(perf|refactor)(\(.+\))?!?:'
+      order: 30
+    - title: "文档"
+      regexp: '^docs(\(.+\))?!?:'
+      order: 40
+    - title: "其他"
+      regexp: '.*'
+      order: 100
 
 release:
   draft: false

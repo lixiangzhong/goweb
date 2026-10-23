@@ -69,6 +69,14 @@ CI 在 Ubuntu、macOS 与 Windows 上运行 `gofmt` 检查、`go mod tidy` 校�
 
 推一个 `v*` 标签即触发 [release.yml](../.github/workflows/release.yml)：先在 Ubuntu 上跑完整测试，再由 GoReleaser 按 [.goreleaser.yaml](../.goreleaser.yaml) 交叉编译 macOS/Linux 的 amd64 与 arm64、生成 `checksums.txt` 并创建 GitHub Release。
 
+发布说明由 GoReleaser 按 `.goreleaser.yaml` 的 `changelog.groups` 自动生成：提交按类型分组为「新功能 / 修复 / 性能与重构 / 文档 / 其他」，只过滤 `ci:`、`chore:`、`test:` 这类工程噪声。因此提交信息要遵守 `<type>(<scope>): <summary>`，否则会落进「其他」。自动说明是一行一条的摘要；需要「概览、升级提示、操作步骤」这类多段式说明时，在 Release 创建后手动补写：
+
+```bash
+gh release edit v0.3.0 --notes-file release-notes.md
+```
+
+补写内容以用户视角为准：先写这次发布解决了什么问题、有无行为变化，再写升级注意事项，最后放完整变更链接。
+
 ```bash
 # 本地预演一次完整打包（产物落在 dist/，不会发布）
 goreleaser release --snapshot --clean
